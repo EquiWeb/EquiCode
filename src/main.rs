@@ -64,5 +64,12 @@ fn parse_model_path() -> Option<String> {
             return args.next();
         }
     }
-    std::env::var("VARCTX_MODEL_PATH").ok()
+    if let Ok(p) = std::env::var("VARCTX_MODEL_PATH") {
+        return Some(p);
+    }
+    let default = "Qwen2.5-Coder-3B-Instruct-F16.gguf";
+    if std::path::Path::new(default).exists() {
+        return Some(default.to_string());
+    }
+    None
 }
