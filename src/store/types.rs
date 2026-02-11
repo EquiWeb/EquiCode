@@ -22,5 +22,8 @@ pub struct VarBinding {
     pub var_name: String,
     pub binding_version: u32,
     pub chunk_ids: Vec<Uuid>,
+    #[serde(default)]
+    /// optional short summary (can be empty)
+    pub summary: String,
     pub created_at: DateTime<Utc>,
 }

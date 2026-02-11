@@ -21,7 +21,7 @@ impl OverlapRetriever {
         let mut scored = Vec::new();
 
         for cid in candidate_chunk_ids {
-            if let Some(txt) = store.get_chunk_text(*cid)? {
+            if let Some(txt) = store.get_chunk_text_lossy(*cid)? {
                 let t = tokenize(&txt);
                 let inter = q.intersection(&t).count() as f32;
                 if inter > 0.0 {

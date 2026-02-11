@@ -103,7 +103,30 @@ impl ContextStore {
         Ok(Some(zstd_decompress(&c.text_zstd)?))
     }
 
+    pub fn get_chunk_text_lossy(&self, chunk_id: Uuid) -> Result<Option<String>> {
+        let Some(raw) = self.chunks.get(chunk_id.as_bytes())? else {
+            return Ok(None);
+        };
+        let c: Chunk = match bincode::deserialize(&raw) {
+            Ok(c) => c,
+            Err(_) => return Ok(None),
+        };
+        if c.tombstone {
+            return Ok(None);
+        }
+        Ok(zstd_decompress(&c.text_zstd).ok())
+    }
+
     pub fn bind_var(&self, var_name: &str, chunk_ids: Vec<Uuid>) -> Result<VarBinding> {
+        self.bind_var_with_summary(var_name, chunk_ids, None)
+    }
+
+    pub fn bind_var_with_summary(
+        &self,
+        var_name: &str,
+        chunk_ids: Vec<Uuid>,
+        summary: Option<String>,
+    ) -> Result<VarBinding> {
         let now = Utc::now();
         let (next_ver, _) = self
             .get_var_binding_latest(var_name)?
@@ -115,6 +138,7 @@ impl ContextStore {
                     var_name: var_name.to_string(),
                     binding_version: 0,
                     chunk_ids: vec![],
+                    summary: String::new(),
                     created_at: now,
                 },
             ));
@@ -124,6 +148,7 @@ impl ContextStore {
             var_name: var_name.to_string(),
             binding_version: next_ver,
             chunk_ids,
+            summary: summary.unwrap_or_default(),
             created_at: now,
         };
 
@@ -138,6 +163,20 @@ impl ContextStore {
             Some(v) => Ok(Some(bincode::deserialize(&v)?)),
             None => Ok(None),
         }
+    }
+
+    pub fn get_var_binding_latest_lossy(&self, var_name: &str) -> Result<Option<VarBinding>> {
+        let Some(raw) = self.vars.get(var_name.as_bytes())? else {
+            return Ok(None);
+        };
+        Ok(bincode::deserialize(&raw).ok())
+    }
+
+    pub fn update_var_summary(&self, var_name: &str, summary: &str) -> Result<VarBinding> {
+        let Some(binding) = self.get_var_binding_latest(var_name)? else {
+            return Err(anyhow!("unknown var: {var_name}"));
+        };
+        self.bind_var_with_summary(var_name, binding.chunk_ids, Some(summary.to_string()))
     }
 
     pub fn materialize_var(&self, var_name: &str, max_chars: usize) -> Result<String> {
@@ -228,10 +267,29 @@ mod tests {
         let ids1 = store.put_doc_chunked("doc:3", "hello world", 200)?;
         let b1 = store.bind_var("V:test", ids1)?;
         assert_eq!(b1.binding_version, 1);
+        assert!(b1.summary.is_empty());
 
         let ids2 = store.put_doc_chunked("doc:4", "another doc", 200)?;
         let b2 = store.bind_var("V:test", ids2)?;
         assert_eq!(b2.binding_version, 2);
+        assert!(b2.summary.is_empty());
+
+        fs::remove_dir_all(path)?;
+        Ok(())
+    }
+
+    #[test]
+    fn update_var_summary_bumps_version() -> Result<()> {
+        let path = test_temp_dir("update_var_summary_bumps_version");
+        let store = ContextStore::open(&path)?;
+
+        let ids = store.put_doc_chunked("doc:summary", "hello world", 200)?;
+        let b1 = store.bind_var("V:sum", ids.clone())?;
+
+        let b2 = store.update_var_summary("V:sum", "short summary")?;
+        assert_eq!(b2.binding_version, b1.binding_version + 1);
+        assert_eq!(b2.summary, "short summary");
+        assert_eq!(b2.chunk_ids, ids);
 
         fs::remove_dir_all(path)?;
         Ok(())
