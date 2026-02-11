@@ -160,6 +160,9 @@ struct App {
     scroll_context: u16,
     scroll_plan: u16,
     scroll_answer: u16,
+    context_width: u16,
+    plan_width: u16,
+    answer_width: u16,
 }
 
 impl App {
@@ -177,6 +180,9 @@ impl App {
             scroll_context: 0,
             scroll_plan: 0,
             scroll_answer: 0,
+            context_width: 80,
+            plan_width: 80,
+            answer_width: 80,
         }
     }
 
@@ -186,16 +192,25 @@ impl App {
 
     fn scroll_active(&mut self, delta: i16) {
         match self.focus {
-            Focus::Context => self.scroll_context = scroll_offset(self.scroll_context, delta, &self.context),
-            Focus::Plan => self.scroll_plan = scroll_offset(self.scroll_plan, delta, &self.plan),
-            Focus::Answer => self.scroll_answer = scroll_offset(self.scroll_answer, delta, &self.answer),
+            Focus::Context => {
+                self.scroll_context =
+                    scroll_offset(self.scroll_context, delta, &self.context, self.context_width)
+            }
+            Focus::Plan => {
+                self.scroll_plan =
+                    scroll_offset(self.scroll_plan, delta, &self.plan, self.plan_width)
+            }
+            Focus::Answer => {
+                self.scroll_answer =
+                    scroll_offset(self.scroll_answer, delta, &self.answer, self.answer_width)
+            }
             Focus::Input => {}
         }
     }
 }
 
-fn scroll_offset(current: u16, delta: i16, text: &str) -> u16 {
-    let lines = text.lines().count().max(1);
+fn scroll_offset(current: u16, delta: i16, text: &str, width: u16) -> u16 {
+    let lines = wrapped_line_count(text, width).max(1);
     let max_scroll = lines.saturating_sub(1) as i16;
     let mut next = current as i16 + delta;
     if next < 0 {
@@ -341,6 +356,12 @@ fn run_task_streaming(
 
         let should_draw = last_draw.elapsed() >= Duration::from_millis(33) || chunk.contains('\n');
         if should_draw {
+            if matches!(target, StreamTarget::Plan) {
+                app.scroll_plan = max_scroll(&app.plan, app.plan_width);
+            }
+            if matches!(target, StreamTarget::Answer) {
+                app.scroll_answer = max_scroll(&app.answer, app.answer_width);
+            }
             let _ = terminal.draw(|f| draw_ui(f, app));
             last_draw = Instant::now();
         }
@@ -356,7 +377,7 @@ fn run_task_streaming(
     Ok(())
 }
 
-fn draw_ui(f: &mut Frame, app: &App) {
+fn draw_ui(f: &mut Frame, app: &mut App) {
     let size = f.area();
     let outer = Layout::default()
         .direction(Direction::Vertical)
@@ -379,23 +400,29 @@ fn draw_ui(f: &mut Frame, app: &App) {
         .split(body[1]);
 
     let context_block = block_with_focus("Context", app.focus == Focus::Context);
-    let context = Paragraph::new(app.context.clone())
+    let context_inner = context_block.inner(body[0]);
+    app.context_width = context_inner.width.max(1);
+    app.scroll_context = clamp_scroll(app.scroll_context, &app.context, app.context_width);
+    let context = Paragraph::new(wrap_text(&app.context, app.context_width))
         .block(context_block)
-        .wrap(Wrap { trim: false })
         .scroll((app.scroll_context, 0));
     f.render_widget(context, body[0]);
 
     let plan_block = block_with_focus("Plan", app.focus == Focus::Plan);
-    let plan = Paragraph::new(app.plan.clone())
+    let plan_inner = plan_block.inner(right[0]);
+    app.plan_width = plan_inner.width.max(1);
+    app.scroll_plan = clamp_scroll(app.scroll_plan, &app.plan, app.plan_width);
+    let plan = Paragraph::new(wrap_text(&app.plan, app.plan_width))
         .block(plan_block)
-        .wrap(Wrap { trim: false })
         .scroll((app.scroll_plan, 0));
     f.render_widget(plan, right[0]);
 
     let answer_block = block_with_focus("Answer", app.focus == Focus::Answer);
-    let answer = Paragraph::new(app.answer.clone())
+    let answer_inner = answer_block.inner(right[1]);
+    app.answer_width = answer_inner.width.max(1);
+    app.scroll_answer = clamp_scroll(app.scroll_answer, &app.answer, app.answer_width);
+    let answer = Paragraph::new(wrap_text(&app.answer, app.answer_width))
         .block(answer_block)
-        .wrap(Wrap { trim: false })
         .scroll((app.scroll_answer, 0));
     f.render_widget(answer, right[1]);
 
@@ -434,6 +461,50 @@ fn header_text(app: &App) -> String {
         "Varctx TUI | Store: {} | Vars: {} | Status: {}",
         store, vars, app.status
     )
+}
+
+fn clamp_scroll(current: u16, text: &str, width: u16) -> u16 {
+    let lines = wrapped_line_count(text, width).max(1);
+    let max_scroll = lines.saturating_sub(1) as u16;
+    current.min(max_scroll)
+}
+
+fn max_scroll(text: &str, width: u16) -> u16 {
+    let lines = wrapped_line_count(text, width).max(1);
+    lines.saturating_sub(1) as u16
+}
+
+fn wrapped_line_count(text: &str, width: u16) -> usize {
+    wrap_text(text, width).lines().count()
+}
+
+fn wrap_text(text: &str, width: u16) -> String {
+    let w = width.max(1) as usize;
+    if text.is_empty() {
+        return String::new();
+    }
+    let mut out = String::new();
+    for (i, line) in text.split('\n').enumerate() {
+        if i > 0 {
+            out.push('\n');
+        }
+        if line.is_empty() {
+            continue;
+        }
+        let chars: Vec<char> = line.chars().collect();
+        let mut start = 0;
+        while start < chars.len() {
+            let end = (start + w).min(chars.len());
+            for ch in &chars[start..end] {
+                out.push(*ch);
+            }
+            start = end;
+            if start < chars.len() {
+                out.push('\n');
+            }
+        }
+    }
+    out
 }
 
 fn init_terminal() -> Result<Terminal<CrosstermBackend<io::Stdout>>> {
