@@ -1,5 +1,8 @@
 use anyhow::{anyhow, Result};
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyModifiers,
+    MouseEvent, MouseEventKind,
+};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
 use crossterm::{execute, ExecutableCommand};
 use ratatui::prelude::*;
@@ -163,6 +166,12 @@ struct App {
     context_width: u16,
     plan_width: u16,
     answer_width: u16,
+    context_rect: Rect,
+    plan_rect: Rect,
+    answer_rect: Rect,
+    input_rect: Rect,
+    auto_follow_plan: bool,
+    auto_follow_answer: bool,
 }
 
 impl App {
@@ -183,6 +192,12 @@ impl App {
             context_width: 80,
             plan_width: 80,
             answer_width: 80,
+            context_rect: Rect::default(),
+            plan_rect: Rect::default(),
+            answer_rect: Rect::default(),
+            input_rect: Rect::default(),
+            auto_follow_plan: true,
+            auto_follow_answer: true,
         }
     }
 
@@ -198,11 +213,15 @@ impl App {
             }
             Focus::Plan => {
                 self.scroll_plan =
-                    scroll_offset(self.scroll_plan, delta, &self.plan, self.plan_width)
+                    scroll_offset(self.scroll_plan, delta, &self.plan, self.plan_width);
+                self.auto_follow_plan =
+                    self.scroll_plan >= max_scroll(&self.plan, self.plan_width);
             }
             Focus::Answer => {
                 self.scroll_answer =
-                    scroll_offset(self.scroll_answer, delta, &self.answer, self.answer_width)
+                    scroll_offset(self.scroll_answer, delta, &self.answer, self.answer_width);
+                self.auto_follow_answer =
+                    self.scroll_answer >= max_scroll(&self.answer, self.answer_width);
             }
             Focus::Input => {}
         }
@@ -231,10 +250,21 @@ fn run_app(
         terminal.draw(|f| draw_ui(f, app))?;
 
         if event::poll(Duration::from_millis(100))? {
-            if let Event::Key(key) = event::read()? {
-                if handle_key(terminal, llm, app, key)? {
-                    return Ok(());
+            match event::read()? {
+                Event::Key(key) => {
+                    if handle_key(terminal, llm, app, key)? {
+                        return Ok(());
+                    }
                 }
+                Event::Mouse(me) => {
+                    if handle_mouse(app, me) {
+                        terminal.draw(|f| draw_ui(f, app))?;
+                    }
+                }
+                Event::Resize(_, _) => {
+                    terminal.draw(|f| draw_ui(f, app))?;
+                }
+                Event::FocusGained | Event::FocusLost | Event::Paste(_) => {}
             }
         }
     }
@@ -293,6 +323,81 @@ fn handle_key(
     Ok(false)
 }
 
+fn handle_key_during_generation(app: &mut App, key: KeyEvent) -> bool {
+    match key.code {
+        KeyCode::Tab => {
+            app.focus = app.focus.next();
+            true
+        }
+        KeyCode::BackTab => {
+            app.focus = app.focus.prev();
+            true
+        }
+        KeyCode::Up => {
+            app.scroll_active(-1);
+            true
+        }
+        KeyCode::Down => {
+            app.scroll_active(1);
+            true
+        }
+        KeyCode::PageUp => {
+            app.scroll_active(-5);
+            true
+        }
+        KeyCode::PageDown => {
+            app.scroll_active(5);
+            true
+        }
+        _ => false,
+    }
+}
+
+fn handle_mouse(app: &mut App, me: MouseEvent) -> bool {
+    let focus = focus_from_point(app, me.column, me.row);
+    match me.kind {
+        MouseEventKind::Down(_) => {
+            if let Some(f) = focus {
+                app.focus = f;
+                return true;
+            }
+        }
+        MouseEventKind::ScrollUp => {
+            if let Some(f) = focus {
+                app.focus = f;
+                app.scroll_active(-3);
+                return true;
+            }
+        }
+        MouseEventKind::ScrollDown => {
+            if let Some(f) = focus {
+                app.focus = f;
+                app.scroll_active(3);
+                return true;
+            }
+        }
+        _ => {}
+    }
+    false
+}
+
+fn focus_from_point(app: &App, x: u16, y: u16) -> Option<Focus> {
+    let p = Position { x, y };
+    if app.context_rect.contains(p) {
+        return Some(Focus::Context);
+    }
+    if app.plan_rect.contains(p) {
+        return Some(Focus::Plan);
+    }
+    if app.answer_rect.contains(p) {
+        return Some(Focus::Answer);
+    }
+    if app.input_rect.contains(p) {
+        return Some(Focus::Input);
+    }
+    None
+}
+
 fn run_task_streaming(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     llm: &mut LlamaCppLlm,
@@ -335,32 +440,42 @@ fn run_task_streaming(
 
     let mut agent = CodingAgent::new(llm, app.agent_cfg.clone());
     let mut last_draw = Instant::now();
+    let mut event_err: Option<anyhow::Error> = None;
     let mut on_stream = |target: StreamTarget, event: StreamEvent, chunk: &str| {
         match (target, event) {
             (StreamTarget::Plan, StreamEvent::Start) => {
                 app.plan.clear();
                 app.scroll_plan = 0;
+                app.auto_follow_plan = true;
             }
             (StreamTarget::Answer, StreamEvent::Start) => {
                 app.answer.clear();
                 app.scroll_answer = 0;
+                app.auto_follow_answer = true;
             }
             (StreamTarget::Plan, StreamEvent::Chunk) => {
+                let at_bottom = app.scroll_plan >= max_scroll(&app.plan, app.plan_width);
                 app.plan.push_str(chunk);
+                if app.auto_follow_plan || at_bottom {
+                    app.scroll_plan = max_scroll(&app.plan, app.plan_width);
+                    app.auto_follow_plan = true;
+                }
             }
             (StreamTarget::Answer, StreamEvent::Chunk) => {
+                let at_bottom = app.scroll_answer >= max_scroll(&app.answer, app.answer_width);
                 app.answer.push_str(chunk);
+                if app.auto_follow_answer || at_bottom {
+                    app.scroll_answer = max_scroll(&app.answer, app.answer_width);
+                    app.auto_follow_answer = true;
+                }
             }
             _ => {}
         }
 
         let should_draw = last_draw.elapsed() >= Duration::from_millis(33) || chunk.contains('\n');
         if should_draw {
-            if matches!(target, StreamTarget::Plan) {
-                app.scroll_plan = max_scroll(&app.plan, app.plan_width);
-            }
-            if matches!(target, StreamTarget::Answer) {
-                app.scroll_answer = max_scroll(&app.answer, app.answer_width);
+            if let Err(err) = drain_events_during_generation(terminal, app) {
+                event_err = Some(err);
             }
             let _ = terminal.draw(|f| draw_ui(f, app));
             last_draw = Instant::now();
@@ -368,12 +483,44 @@ fn run_task_streaming(
     };
 
     let result = agent.run_streaming(&task, context.as_deref(), &mut on_stream)?;
+    if let Some(err) = event_err {
+        return Err(err);
+    }
 
     app.plan = result.plan.trim().to_string();
     app.answer = result.answer.trim().to_string();
     let _ = terminal.draw(|f| draw_ui(f, app));
     app.scroll_plan = 0;
     app.scroll_answer = 0;
+    Ok(())
+}
+
+fn drain_events_during_generation(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    app: &mut App,
+) -> Result<()> {
+    let mut drew = false;
+    while event::poll(Duration::from_millis(0))? {
+        match event::read()? {
+            Event::Key(key) => {
+                if handle_key_during_generation(app, key) {
+                    drew = true;
+                }
+            }
+            Event::Mouse(me) => {
+                if handle_mouse(app, me) {
+                    drew = true;
+                }
+            }
+            Event::Resize(_, _) => {
+                drew = true;
+            }
+            Event::FocusGained | Event::FocusLost | Event::Paste(_) => {}
+        }
+    }
+    if drew {
+        terminal.draw(|f| draw_ui(f, app))?;
+    }
     Ok(())
 }
 
@@ -399,8 +546,9 @@ fn draw_ui(f: &mut Frame, app: &mut App) {
         .constraints([Constraint::Length(9), Constraint::Min(5)])
         .split(body[1]);
 
+    app.context_rect = body[0];
     let context_block = block_with_focus("Context", app.focus == Focus::Context);
-    let context_inner = context_block.inner(body[0]);
+    let context_inner = context_block.inner(app.context_rect);
     app.context_width = context_inner.width.max(1);
     app.scroll_context = clamp_scroll(app.scroll_context, &app.context, app.context_width);
     let context = Paragraph::new(wrap_text(&app.context, app.context_width))
@@ -408,8 +556,9 @@ fn draw_ui(f: &mut Frame, app: &mut App) {
         .scroll((app.scroll_context, 0));
     f.render_widget(context, body[0]);
 
+    app.plan_rect = right[0];
     let plan_block = block_with_focus("Plan", app.focus == Focus::Plan);
-    let plan_inner = plan_block.inner(right[0]);
+    let plan_inner = plan_block.inner(app.plan_rect);
     app.plan_width = plan_inner.width.max(1);
     app.scroll_plan = clamp_scroll(app.scroll_plan, &app.plan, app.plan_width);
     let plan = Paragraph::new(wrap_text(&app.plan, app.plan_width))
@@ -417,8 +566,9 @@ fn draw_ui(f: &mut Frame, app: &mut App) {
         .scroll((app.scroll_plan, 0));
     f.render_widget(plan, right[0]);
 
+    app.answer_rect = right[1];
     let answer_block = block_with_focus("Answer", app.focus == Focus::Answer);
-    let answer_inner = answer_block.inner(right[1]);
+    let answer_inner = answer_block.inner(app.answer_rect);
     app.answer_width = answer_inner.width.max(1);
     app.scroll_answer = clamp_scroll(app.scroll_answer, &app.answer, app.answer_width);
     let answer = Paragraph::new(wrap_text(&app.answer, app.answer_width))
@@ -426,6 +576,7 @@ fn draw_ui(f: &mut Frame, app: &mut App) {
         .scroll((app.scroll_answer, 0));
     f.render_widget(answer, right[1]);
 
+    app.input_rect = outer[2];
     let input_block = block_with_focus("Task Input", app.focus == Focus::Input);
     let input = Paragraph::new(app.task_input.clone())
         .block(input_block)
@@ -510,7 +661,7 @@ fn wrap_text(text: &str, width: u16) -> String {
 fn init_terminal() -> Result<Terminal<CrosstermBackend<io::Stdout>>> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
+    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
     let backend = CrosstermBackend::new(stdout);
     let terminal = Terminal::new(backend)?;
     Ok(terminal)
@@ -518,7 +669,10 @@ fn init_terminal() -> Result<Terminal<CrosstermBackend<io::Stdout>>> {
 
 fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> {
     disable_raw_mode()?;
-    terminal.backend_mut().execute(LeaveAlternateScreen)?;
+    terminal
+        .backend_mut()
+        .execute(DisableMouseCapture)?
+        .execute(LeaveAlternateScreen)?;
     terminal.show_cursor()?;
     Ok(())
 }
