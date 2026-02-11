@@ -3,6 +3,8 @@ use encoding_rs::UTF_8;
 use std::mem::ManuallyDrop;
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use llama_cpp_2::context::params::LlamaContextParams;
 use llama_cpp_2::llama_backend::LlamaBackend;
@@ -57,6 +59,7 @@ pub struct LlmConfig {
     pub use_chat_template: bool,
     pub system_prompt: Option<String>,
     pub silence_logs: bool,
+    pub cancel_flag: Option<Arc<AtomicBool>>,
 }
 
 impl LlmConfig {
@@ -74,6 +77,7 @@ impl LlmConfig {
             use_chat_template: true,
             system_prompt: None,
             silence_logs: false,
+            cancel_flag: None,
         }
     }
 
@@ -147,6 +151,7 @@ pub struct LlamaCppLlm {
     model_ptr: *mut LlamaModel,
     ctx: ManuallyDrop<llama_cpp_2::context::LlamaContext<'static>>,
     config: LlmConfig,
+    cancel_flag: Option<Arc<AtomicBool>>,
 }
 
 impl LlamaCppLlm {
@@ -185,6 +190,7 @@ impl LlamaCppLlm {
             _backend: backend,
             model_ptr,
             ctx: ManuallyDrop::new(ctx),
+            cancel_flag: config.cancel_flag.clone(),
             config,
         })
     }
@@ -288,6 +294,11 @@ impl Llm for LlamaCppLlm {
         let mut out = String::new();
 
         for _ in 0..max_tokens {
+            if let Some(flag) = &self.cancel_flag {
+                if flag.load(Ordering::SeqCst) {
+                    break;
+                }
+            }
             let token = sampler.sample(&self.ctx, sample_idx);
             sampler.accept(token);
             sample_idx = 0;
