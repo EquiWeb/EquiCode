@@ -67,3 +67,36 @@ Optional env vars for model config:
 - `VARCTX_N_GPU_LAYERS`
 - `VARCTX_TEMP`, `VARCTX_TOP_K`, `VARCTX_TOP_P`
 - `VARCTX_USE_CHAT_TEMPLATE`, `VARCTX_SYSTEM_PROMPT`
+
+## TUI (Claude Code style)
+Run the interactive TUI:
+
+```
+cargo run --bin coding_agent_tui -- \
+  --store ./varctx_db \
+  --vars V:demo_doc \
+  --top-k 8
+```
+
+Optional flags:
+- `--mode yolo|confirm|paranoid` (tool approval policy)
+- `--skills-dir ./skills` (enable `/skills` tools)
+- `--allow-network` (enable network tools)
+
+### Skills
+This repo includes a minimal `/skills` example:
+- `skills/filesystem` with `filesystem.read`, `filesystem.list`, `filesystem.write`, `filesystem.grep`.
+
+The skill entrypoint is a subprocess that reads a JSON tool call from stdin and returns JSON on stdout.
+It requires `python3` to be available on your system.
+
+### Monty tool
+The TUI always exposes a built-in `code.exec` tool powered by `pydantic/monty` (Rust).
+It runs Monty code directly in-process without Python.
+
+Monty helper functions (hosted by EquiCode, subject to safety policy):
+- `read(path)`
+- `write(path, content)`
+- `list(path)`
+- `grep(path, pattern)`
+- `exists(path)`

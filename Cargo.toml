@@ -6,6 +6,7 @@ edition = "2021"
 [dependencies]
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 bincode = "1"
 uuid = { version = "1", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
@@ -18,3 +19,5 @@ encoding_rs = "0.8"
 ratatui = "0.29"
 crossterm = "0.27"
 arboard = "3"
+walkdir = "2.5.0"
+monty = { git = "https://github.com/pydantic/monty" }

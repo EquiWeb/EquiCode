@@ -1,3 +1,4 @@
 /target
+.cargo/
 Qwen2.5-Coder-3B-Instruct-F16.gguf
 varctx_db/

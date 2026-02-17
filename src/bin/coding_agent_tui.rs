@@ -8,8 +8,9 @@ use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScree
 use crossterm::{execute, ExecutableCommand};
 use ratatui::prelude::*;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use std::io;
+use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -21,6 +22,12 @@ use varctx_proto::agent::{CodingAgent, CodingAgentConfig, StreamEvent, StreamTar
 use varctx_proto::llm::{LlamaCppLlm, LlmConfig};
 use varctx_proto::retrieval::OverlapRetriever;
 use varctx_proto::store::ContextStore;
+use varctx_proto::tools::{
+    builtin_fs::{edit_file_at, list_dir, read_file_at, resolve_path_arg},
+    builtin_shell::run_shell_exec,
+    monty::run_code_exec,
+    ExecMode, PolicyDecision, SafetyPolicy, SkillHost, ToolCall, ToolSpec,
+};
 
 fn main() -> Result<()> {
     let args = TuiArgs::from_env()?;
@@ -42,14 +49,45 @@ fn main() -> Result<()> {
     llm_cfg.cancel_flag = Some(cancel_flag.clone());
     let model_ctx = llm_cfg.n_ctx.unwrap_or(0);
 
+    let skills_dir = resolve_skills_dir(args.skills_dir.as_deref());
+    let mut tool_names = Vec::new();
+    let mut tool_specs: Vec<ToolSpec> = Vec::new();
+    if let Some(dir) = skills_dir.as_ref() {
+        let host = SkillHost::load(dir)?;
+        tool_specs = host.tool_specs();
+        tool_names = tool_specs.iter().map(|t| t.name.clone()).collect();
+    }
+    if !tool_names.iter().any(|t| t == "code.exec") {
+        tool_names.push("code.exec".to_string());
+    }
+    for builtin in ["fs.list", "fs.read", "fs.edit", "shell.exec"] {
+        if !tool_names.iter().any(|t| t == builtin) {
+            tool_names.push(builtin.to_string());
+        }
+    }
+
+    let policy = SafetyPolicy {
+        mode: parse_exec_mode(args.exec_mode.clone()),
+        workspace_root: std::env::current_dir()?,
+        allow_network: args.allow_network,
+    };
+
     let (cmd_tx, cmd_rx) = mpsc::channel();
     let (evt_tx, evt_rx) = mpsc::channel();
     let worker_cfg = llm_cfg;
     let worker_agent_cfg = agent_cfg.clone();
-    let worker_handle = thread::spawn(move || worker_loop(cmd_rx, evt_tx, worker_cfg, worker_agent_cfg));
+    let worker_settings = WorkerSettings {
+        skills_dir,
+        policy,
+        tool_timeout: Duration::from_secs(30),
+    };
+    let worker_handle =
+        thread::spawn(move || worker_loop(cmd_rx, evt_tx, worker_cfg, worker_agent_cfg, worker_settings));
 
     let mut terminal = init_terminal()?;
     let mut app = App::new(args, agent_cfg, model_ctx, cancel_flag);
+    app.tool_names = tool_names;
+    app.tool_schema_text = format_tool_schemas(&tool_specs);
     let res = run_app(&mut terminal, &mut app, cmd_tx.clone(), evt_rx);
     restore_terminal(&mut terminal)?;
 
@@ -68,6 +106,9 @@ struct TuiArgs {
     plan_tokens: Option<usize>,
     answer_tokens: Option<usize>,
     preset_task: Option<String>,
+    skills_dir: Option<String>,
+    exec_mode: Option<String>,
+    allow_network: bool,
 }
 
 impl TuiArgs {
@@ -82,6 +123,9 @@ impl TuiArgs {
         let mut plan_tokens = None;
         let mut answer_tokens = None;
         let mut preset_task = None;
+        let mut skills_dir = None;
+        let mut exec_mode = None;
+        let mut allow_network = false;
 
         while let Some(arg) = args.next() {
             match arg.as_str() {
@@ -121,6 +165,9 @@ impl TuiArgs {
                         answer_tokens = v.parse::<usize>().ok();
                     }
                 }
+                "--skills-dir" => skills_dir = args.next(),
+                "--mode" => exec_mode = args.next(),
+                "--allow-network" => allow_network = true,
                 "--task" => preset_task = args.next(),
                 _ => {}
             }
@@ -136,6 +183,9 @@ impl TuiArgs {
             plan_tokens,
             answer_tokens,
             preset_task,
+            skills_dir,
+            exec_mode,
+            allow_network,
         })
     }
 }
@@ -143,9 +193,23 @@ impl TuiArgs {
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Focus {
     Input,
+    Chat,
+    Overlay,
+    Approval,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum OverlayKind {
     Context,
     Plan,
-    Answer,
+    Tools,
+    Help,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Pane {
+    Chat,
+    Overlay,
 }
 
 enum WorkerCommand {
@@ -154,6 +218,12 @@ enum WorkerCommand {
         context: Option<String>,
         plan_tokens: usize,
         answer_tokens: usize,
+        tool_names: Vec<String>,
+        tool_schema_text: String,
+    },
+    ToolDecision {
+        id: u64,
+        allow: bool,
     },
     Shutdown,
 }
@@ -164,6 +234,14 @@ enum WorkerEvent {
         event: StreamEvent,
         chunk: String,
     },
+    ToolApprovalRequired {
+        id: u64,
+        call: ToolCall,
+        decision: PolicyDecision,
+    },
+    ToolLog {
+        line: String,
+    },
     Done {
         plan: String,
         answer: String,
@@ -173,22 +251,28 @@ enum WorkerEvent {
     Error(String),
 }
 
+struct WorkerSettings {
+    skills_dir: Option<PathBuf>,
+    policy: SafetyPolicy,
+    tool_timeout: Duration,
+}
+
 impl Focus {
     fn next(self) -> Self {
         match self {
-            Self::Input => Self::Context,
-            Self::Context => Self::Plan,
-            Self::Plan => Self::Answer,
-            Self::Answer => Self::Input,
+            Self::Input => Self::Chat,
+            Self::Chat => Self::Overlay,
+            Self::Overlay => Self::Input,
+            Self::Approval => Self::Input,
         }
     }
 
     fn prev(self) -> Self {
         match self {
-            Self::Input => Self::Answer,
-            Self::Context => Self::Input,
-            Self::Plan => Self::Context,
-            Self::Answer => Self::Plan,
+            Self::Input => Self::Overlay,
+            Self::Chat => Self::Input,
+            Self::Overlay => Self::Chat,
+            Self::Approval => Self::Input,
         }
     }
 }
@@ -197,11 +281,13 @@ struct App {
     args: TuiArgs,
     agent_cfg: CodingAgentConfig,
     focus: Focus,
+    overlay: Option<OverlayKind>,
     status: String,
     task_input: String,
     context: String,
     plan: String,
     answer: String,
+    tools_log: String,
     history: Vec<ChatEntry>,
     current_turn: Option<usize>,
     context_tokens_est: usize,
@@ -212,22 +298,28 @@ struct App {
     model_ctx: u32,
     is_generating: bool,
     cancel_flag: Arc<AtomicBool>,
-    scroll_context: u16,
-    scroll_plan: u16,
-    scroll_answer: u16,
-    context_width: u16,
-    plan_width: u16,
-    answer_width: u16,
-    context_rect: Rect,
-    plan_rect: Rect,
-    answer_rect: Rect,
+    tool_names: Vec<String>,
+    tool_schema_text: String,
+    scroll_chat: u16,
+    scroll_overlay: u16,
+    chat_width: u16,
+    chat_height: u16,
+    overlay_width: u16,
+    overlay_height: u16,
+    chat_rect: Rect,
+    overlay_rect: Rect,
     input_rect: Rect,
-    auto_follow_plan: bool,
-    auto_follow_answer: bool,
+    auto_follow_chat: bool,
+    auto_follow_overlay: bool,
     clipboard: Option<Clipboard>,
-    selection_mode: bool,
     selection: Option<Selection>,
     last_mouse: Option<Position>,
+    pending_tool: Option<PendingTool>,
+    approval_prompt_active: bool,
+    approval_prompt: String,
+    pending_followup_prompt: Option<String>,
+    exec_mode: ExecMode,
+    spinner_idx: usize,
 }
 
 impl App {
@@ -238,15 +330,18 @@ impl App {
         cancel_flag: Arc<AtomicBool>,
     ) -> Self {
         let task_input = args.preset_task.clone().unwrap_or_default();
-        Self {
+        let exec_mode = parse_exec_mode(args.exec_mode.clone());
+        let mut app = Self {
             args,
             agent_cfg,
             focus: Focus::Input,
+            overlay: None,
             status: "Ready".to_string(),
             task_input,
             context: "No context loaded.".to_string(),
             plan: String::new(),
             answer: String::new(),
+            tools_log: String::new(),
             history: Vec::new(),
             current_turn: None,
             context_tokens_est: 0,
@@ -257,23 +352,38 @@ impl App {
             model_ctx,
             is_generating: false,
             cancel_flag,
-            scroll_context: 0,
-            scroll_plan: 0,
-            scroll_answer: 0,
-            context_width: 80,
-            plan_width: 80,
-            answer_width: 80,
-            context_rect: Rect::default(),
-            plan_rect: Rect::default(),
-            answer_rect: Rect::default(),
+            tool_names: Vec::new(),
+            tool_schema_text: String::new(),
+            scroll_chat: 0,
+            scroll_overlay: 0,
+            chat_width: 80,
+            chat_height: 1,
+            overlay_width: 60,
+            overlay_height: 1,
+            chat_rect: Rect::default(),
+            overlay_rect: Rect::default(),
             input_rect: Rect::default(),
-            auto_follow_plan: true,
-            auto_follow_answer: true,
+            auto_follow_chat: true,
+            auto_follow_overlay: true,
             clipboard: Clipboard::new().ok(),
-            selection_mode: false,
             selection: None,
             last_mouse: None,
-        }
+            pending_tool: None,
+            approval_prompt_active: false,
+            approval_prompt: String::new(),
+            pending_followup_prompt: None,
+            exec_mode,
+            spinner_idx: 0,
+        };
+        app.history.push(ChatEntry {
+            user: "Quick Start".to_string(),
+            answer: QUICK_START_TEXT.to_string(),
+            tools: String::new(),
+            stats: String::new(),
+        });
+        app.update_history_render();
+        app.scroll_chat = max_scroll(&app.answer, app.chat_width, app.chat_height);
+        app
     }
 
     fn set_error(&mut self, err: &anyhow::Error) {
@@ -290,6 +400,10 @@ impl App {
             out.push_str(&entry.user);
             out.push_str("\n\nASSISTANT:\n");
             out.push_str(&entry.answer);
+            if !entry.tools.trim().is_empty() {
+                out.push_str("\n\nTOOLS:\n");
+                out.push_str(entry.tools.trim_end());
+            }
             if !entry.stats.trim().is_empty() {
                 out.push_str("\n\n");
                 out.push_str(entry.stats.trim());
@@ -298,17 +412,13 @@ impl App {
         self.answer = out;
     }
 
-    fn copy_focused(&mut self) {
-        let text = self
-            .selection_text(self.focus)
-            .unwrap_or_else(|| match self.focus {
-            Focus::Context => self.context.clone(),
-            Focus::Plan => self.plan.clone(),
-            Focus::Answer => self.answer.clone(),
-            Focus::Input => self.task_input.clone(),
-            });
+    fn copy_selection(&mut self) {
+        let Some(text) = self.selection_text() else {
+            self.status = "Nothing selected".to_string();
+            return;
+        };
         if text.is_empty() {
-            self.status = "Nothing to copy".to_string();
+            self.status = "Nothing selected".to_string();
             return;
         }
         match self.clipboard.as_mut() {
@@ -326,73 +436,78 @@ impl App {
         }
     }
 
-    fn selection_text(&self, focus: Focus) -> Option<String> {
+    fn selection_text(&self) -> Option<String> {
         let sel = self.selection.as_ref()?;
-        if sel.target != focus || sel.is_empty() {
+        if sel.is_empty() {
             return None;
         }
-        let (text, width) = match focus {
-            Focus::Context => (&self.context, self.context_width),
-            Focus::Plan => (&self.plan, self.plan_width),
-            Focus::Answer => (&self.answer, self.answer_width),
-            Focus::Input => (&self.task_input, self.context_width),
+        let (text, width) = match sel.target {
+            Pane::Chat => (self.answer.as_str(), self.chat_width),
+            Pane::Overlay => {
+                let Some(overlay_text) = overlay_text(self) else {
+                    return None;
+                };
+                (overlay_text, self.overlay_width)
+            }
         };
         Some(extract_selection_text(text, width, sel))
     }
 
     fn scroll_active(&mut self, delta: i16) {
         match self.focus {
-            Focus::Context => {
-                self.scroll_context =
-                    scroll_offset(self.scroll_context, delta, &self.context, self.context_width)
+            Focus::Chat => {
+                self.scroll_chat = scroll_offset(
+                    self.scroll_chat,
+                    delta,
+                    &self.answer,
+                    self.chat_width,
+                    self.chat_height,
+                );
+                self.auto_follow_chat =
+                    self.scroll_chat >= max_scroll(&self.answer, self.chat_width, self.chat_height);
             }
-            Focus::Plan => {
-                self.scroll_plan =
-                    scroll_offset(self.scroll_plan, delta, &self.plan, self.plan_width);
-                self.auto_follow_plan =
-                    self.scroll_plan >= max_scroll(&self.plan, self.plan_width);
+            Focus::Overlay => {
+                let text = match self.overlay {
+                    Some(OverlayKind::Context) => self.context.as_str(),
+                    Some(OverlayKind::Plan) => self.plan.as_str(),
+                    Some(OverlayKind::Tools) => self.tools_log.as_str(),
+                    Some(OverlayKind::Help) => HELP_TEXT,
+                    None => return,
+                };
+                let next = scroll_offset(
+                    self.scroll_overlay,
+                    delta,
+                    text,
+                    self.overlay_width,
+                    self.overlay_height,
+                );
+                self.scroll_overlay = next;
+                self.auto_follow_overlay =
+                    self.scroll_overlay >= max_scroll(text, self.overlay_width, self.overlay_height);
             }
-            Focus::Answer => {
-                self.scroll_answer =
-                    scroll_offset(self.scroll_answer, delta, &self.answer, self.answer_width);
-                self.auto_follow_answer =
-                    self.scroll_answer >= max_scroll(&self.answer, self.answer_width);
-            }
-            Focus::Input => {}
+            Focus::Input | Focus::Approval => {}
         }
     }
-}
-
-fn toggle_selection_mode(
-    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
-    app: &mut App,
-) -> Result<()> {
-    if app.selection_mode {
-        terminal.backend_mut().execute(EnableMouseCapture)?;
-        app.selection_mode = false;
-        app.status = if app.is_generating {
-            "Running...".to_string()
-        } else {
-            "Ready".to_string()
-        };
-    } else {
-        terminal.backend_mut().execute(DisableMouseCapture)?;
-        app.selection_mode = true;
-        app.status = "Selection mode: drag to select, press s to resume".to_string();
-    }
-    Ok(())
 }
 
 #[derive(Debug, Clone)]
 struct ChatEntry {
     user: String,
     answer: String,
+    tools: String,
     stats: String,
 }
 
 #[derive(Debug, Clone)]
+struct PendingTool {
+    id: u64,
+    call: ToolCall,
+    decision: PolicyDecision,
+}
+
+#[derive(Debug, Clone)]
 struct Selection {
-    target: Focus,
+    target: Pane,
     start_line: usize,
     start_col: usize,
     end_line: usize,
@@ -424,9 +539,10 @@ impl Selection {
     }
 }
 
-fn scroll_offset(current: u16, delta: i16, text: &str, width: u16) -> u16 {
+fn scroll_offset(current: u16, delta: i16, text: &str, width: u16, height: u16) -> u16 {
     let lines = wrapped_line_count(text, width).max(1);
-    let max_scroll = lines.saturating_sub(1) as i16;
+    let visible = height.max(1) as i16;
+    let max_scroll = (lines as i16).saturating_sub(visible).max(0);
     let mut next = current as i16 + delta;
     if next < 0 {
         next = 0;
@@ -476,6 +592,124 @@ fn run_app(
     }
 }
 
+const HELP_TEXT: &str = "\
+Commands:
+/context  Toggle context overlay
+/plan     Toggle plan overlay
+/tools    Toggle tools overlay
+/help     Toggle this help
+/close    Close overlay
+
+Keys:
+Tab / Shift+Tab  Cycle focus
+Esc             Clear selection / close overlay / exit
+Ctrl+C          Cancel run (or quit)
+
+Mouse:
+Drag to select text, release to copy
+
+Tool approvals:
+a / Enter = approve
+n / Backspace = decline
+e = deny with prompt
+";
+
+const QUICK_START_TEXT: &str = "\
+Welcome to EquiCode.
+
+Quick start:
+- Type a task and press Enter.
+- /context, /plan, /tools to open overlays.
+- Tab switches focus, Esc closes overlays.
+
+Built-in tools:
+- fs.list, fs.read, fs.edit (read before edit)
+- shell.exec (requires approval)
+- code.exec (Monty, requires approval)
+";
+
+fn format_tool_schemas(specs: &[ToolSpec]) -> String {
+    if specs.is_empty() {
+        return String::new();
+    }
+    let mut out = String::new();
+    for spec in specs {
+        let schema = serde_json::to_string(&spec.input_schema).unwrap_or_else(|_| "{}".to_string());
+        out.push_str("- ");
+        out.push_str(&spec.name);
+        out.push(' ');
+        out.push_str(&schema);
+        out.push('\n');
+    }
+    out
+}
+
+fn overlay_title(kind: OverlayKind) -> &'static str {
+    match kind {
+        OverlayKind::Context => "Context",
+        OverlayKind::Plan => "Plan",
+        OverlayKind::Tools => "Tools",
+        OverlayKind::Help => "Help",
+    }
+}
+
+fn overlay_text(app: &App) -> Option<&str> {
+    match app.overlay {
+        Some(OverlayKind::Context) => Some(&app.context),
+        Some(OverlayKind::Plan) => Some(&app.plan),
+        Some(OverlayKind::Tools) => Some(&app.tools_log),
+        Some(OverlayKind::Help) => Some(HELP_TEXT),
+        None => None,
+    }
+}
+
+fn toggle_overlay(app: &mut App, kind: OverlayKind) {
+    if app.overlay == Some(kind) {
+        app.overlay = None;
+        if app.focus == Focus::Overlay {
+            app.focus = Focus::Chat;
+        }
+        app.status = format!("{} closed", overlay_title(kind));
+    } else {
+        app.overlay = Some(kind);
+        app.focus = Focus::Overlay;
+        app.scroll_overlay = 0;
+        app.auto_follow_overlay = true;
+        app.status = format!("{} open", overlay_title(kind));
+    }
+    app.selection = None;
+}
+
+fn handle_command(app: &mut App, input: &str) -> bool {
+    let trimmed = input.trim();
+    if !trimmed.starts_with('/') {
+        return false;
+    }
+    let cmd = trimmed.trim_start_matches('/').split_whitespace().next().unwrap_or("");
+    match cmd {
+        "context" => toggle_overlay(app, OverlayKind::Context),
+        "plan" => toggle_overlay(app, OverlayKind::Plan),
+        "tools" => toggle_overlay(app, OverlayKind::Tools),
+        "help" | "?" => toggle_overlay(app, OverlayKind::Help),
+        "close" | "hide" => {
+            app.overlay = None;
+            if app.focus == Focus::Overlay {
+                app.focus = Focus::Chat;
+            }
+            app.status = "Overlay closed".to_string();
+        }
+        "clear" => {
+            app.history.clear();
+            app.answer.clear();
+            app.status = "Chat cleared".to_string();
+        }
+        _ => {
+            app.status = format!("Unknown command: {}", cmd);
+        }
+    }
+    true
+}
+
 fn handle_key(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     app: &mut App,
@@ -491,21 +725,77 @@ fn handle_key(
         return Ok(true);
     }
 
-    if app.selection_mode {
-        match key.code {
-            KeyCode::Char('s')
-                if key.modifiers.contains(KeyModifiers::CONTROL)
-                    || app.focus != Focus::Input =>
-            {
-                toggle_selection_mode(terminal, app)?;
+    if let Some(pending) = app.pending_tool.clone() {
+        if app.approval_prompt_active {
+            match key.code {
+                KeyCode::Enter => {
+                    if app.approval_prompt.trim().is_empty() {
+                        app.status = "Enter a prompt or Esc to cancel".to_string();
+                        return Ok(false);
+                    }
+                    cmd_tx.send(WorkerCommand::ToolDecision {
+                        id: pending.id,
+                        allow: false,
+                    })?;
+                    app.pending_followup_prompt =
+                        Some(app.approval_prompt.trim().to_string());
+                    app.approval_prompt.clear();
+                    app.approval_prompt_active = false;
+                    app.pending_tool = None;
+                    app.focus = Focus::Input;
+                    app.status = "Tool denied. Prompt ready.".to_string();
+                    return Ok(false);
+                }
+                KeyCode::Esc => {
+                    app.approval_prompt_active = false;
+                    app.approval_prompt.clear();
+                    app.status = "Tool approval required".to_string();
+                    return Ok(false);
+                }
+                KeyCode::Backspace => {
+                    app.approval_prompt.pop();
+                    return Ok(false);
+                }
+                KeyCode::Char(c) => {
+                    if !key.modifiers.contains(KeyModifiers::CONTROL) {
+                        app.approval_prompt.push(c);
+                    }
+                    return Ok(false);
+                }
+                _ => return Ok(false),
             }
-            KeyCode::Esc => {
-                toggle_selection_mode(terminal, app)?;
+        } else {
+            match key.code {
+                KeyCode::Enter | KeyCode::Char('a') => {
+                    cmd_tx.send(WorkerCommand::ToolDecision {
+                        id: pending.id,
+                        allow: true,
+                    })?;
+                    app.status = "Tool approved".to_string();
+                    app.pending_tool = None;
+                    app.focus = Focus::Chat;
+                    return Ok(false);
+                }
+                KeyCode::Char('n') | KeyCode::Backspace => {
+                    cmd_tx.send(WorkerCommand::ToolDecision {
+                        id: pending.id,
+                        allow: false,
+                    })?;
+                    app.status = "Tool rejected".to_string();
+                    app.pending_tool = None;
+                    app.focus = Focus::Input;
+                    return Ok(false);
+                }
+                KeyCode::Char('e') => {
+                    app.approval_prompt_active = true;
+                    app.approval_prompt.clear();
+                    app.focus = Focus::Approval;
+                    app.status = "Enter denial prompt (Enter to send, Esc to cancel)".to_string();
+                    return Ok(false);
+                }
+                _ => return Ok(false),
             }
-            KeyCode::Char('q') => return Ok(true),
-            _ => {}
         }
-        return Ok(false);
     }
 
     match key.code {
@@ -513,6 +803,16 @@ fn handle_key(
             if app.selection.is_some() {
                 app.selection = None;
                 app.status = "Selection cleared".to_string();
+                return Ok(false);
+            }
+            if app.overlay.is_some() {
+                app.overlay = None;
+                if app.focus == Focus::Overlay {
+                    app.focus = Focus::Chat;
+                }
+                app.scroll_overlay = 0;
+                app.auto_follow_overlay = true;
+                app.status = "Overlay closed".to_string();
                 return Ok(false);
             }
             if app.focus == Focus::Input && !app.task_input.is_empty() {
@@ -523,30 +823,40 @@ fn handle_key(
         }
         KeyCode::Char('q') if app.focus != Focus::Input => return Ok(true),
         KeyCode::Tab => {
-            app.focus = app.focus.next();
+            if app.overlay.is_some() {
+                app.focus = app.focus.next();
+            } else {
+                app.focus = if app.focus == Focus::Input {
+                    Focus::Chat
+                } else {
+                    Focus::Input
+                };
+            }
             app.selection = None;
         }
         KeyCode::BackTab => {
-            app.focus = app.focus.prev();
+            if app.overlay.is_some() {
+                app.focus = app.focus.prev();
+            } else {
+                app.focus = if app.focus == Focus::Input {
+                    Focus::Chat
+                } else {
+                    Focus::Input
+                };
+            }
             app.selection = None;
         }
         KeyCode::Up => app.scroll_active(-1),
         KeyCode::Down => app.scroll_active(1),
         KeyCode::PageUp => app.scroll_active(-5),
         KeyCode::PageDown => app.scroll_active(5),
-        KeyCode::Char('s')
-            if key.modifiers.contains(KeyModifiers::CONTROL) || app.focus != Focus::Input =>
-        {
-            toggle_selection_mode(terminal, app)?;
-        }
-        KeyCode::Char('y')
-            if app.focus != Focus::Input
-                || key.modifiers.contains(KeyModifiers::CONTROL) =>
-        {
-            app.copy_focused();
-        }
         KeyCode::Enter if app.focus == Focus::Input => {
             if app.task_input.trim().is_empty() {
+                return Ok(false);
+            }
+            let input = app.task_input.trim().to_string();
+            if handle_command(app, &input) {
+                app.task_input.clear();
                 return Ok(false);
             }
             if app.is_generating {
@@ -568,10 +878,15 @@ fn handle_key(
         KeyCode::Backspace if app.focus == Focus::Input => {
             app.task_input.pop();
         }
-        KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) && app.focus == Focus::Input => {
+        KeyCode::Char('u')
+            if key.modifiers.contains(KeyModifiers::CONTROL) && app.focus == Focus::Input =>
+        {
             app.task_input.clear();
         }
-        KeyCode::Char(c) if app.focus == Focus::Input && !key.modifiers.contains(KeyModifiers::CONTROL) => {
+        KeyCode::Char(c)
+            if app.focus == Focus::Input
+                && !key.modifiers.contains(KeyModifiers::CONTROL) =>
+        {
             app.task_input.push(c);
         }
         _ => {}
@@ -581,9 +896,6 @@ fn handle_key(
 }
 
 fn handle_mouse(app: &mut App, me: MouseEvent) -> bool {
-    if app.selection_mode {
-        return false;
-    }
     app.last_mouse = Some(Position {
         x: me.column,
         y: me.row,
@@ -593,12 +905,17 @@ fn handle_mouse(app: &mut App, me: MouseEvent) -> bool {
         MouseEventKind::Down(crossterm::event::MouseButton::Left) => {
             if let Some(f) = focus {
                 app.focus = f;
-                if matches!(f, Focus::Context | Focus::Plan | Focus::Answer) {
+                if matches!(f, Focus::Chat | Focus::Overlay) {
+                    let pane = if f == Focus::Chat {
+                        Pane::Chat
+                    } else {
+                        Pane::Overlay
+                    };
                     if let Some((line, col)) =
-                        selection_pos_for_focus(app, f, me.column, me.row)
+                        selection_pos_for_pane(app, pane, me.column, me.row)
                     {
                         app.selection = Some(Selection {
-                            target: f,
+                            target: pane,
                             start_line: line,
                             start_col: col,
                             end_line: line,
@@ -617,7 +934,7 @@ fn handle_mouse(app: &mut App, me: MouseEvent) -> bool {
                 Some(sel) if sel.active => sel.target,
                 _ => return false,
             };
-            if let Some((line, col)) = selection_pos_for_focus(app, target, me.column, me.row) {
+            if let Some((line, col)) = selection_pos_for_pane(app, target, me.column, me.row) {
                 if let Some(sel) = app.selection.as_mut() {
                     sel.end_line = line;
                     sel.end_col = col;
@@ -628,7 +945,7 @@ fn handle_mouse(app: &mut App, me: MouseEvent) -> bool {
         MouseEventKind::Up(crossterm::event::MouseButton::Left) => {
             if let Some(sel) = app.selection.as_mut() {
                 sel.active = false;
-                app.copy_focused();
+                app.copy_selection();
                 return true;
             }
         }
@@ -655,14 +972,11 @@ fn handle_mouse(app: &mut App, me: MouseEvent) -> bool {
 
 fn focus_from_point(app: &App, x: u16, y: u16) -> Option<Focus> {
     let p = Position { x, y };
-    if app.context_rect.contains(p) {
-        return Some(Focus::Context);
+    if app.chat_rect.contains(p) {
+        return Some(Focus::Chat);
     }
-    if app.plan_rect.contains(p) {
-        return Some(Focus::Plan);
-    }
-    if app.answer_rect.contains(p) {
-        return Some(Focus::Answer);
+    if app.overlay.is_some() && app.overlay_rect.contains(p) {
+        return Some(Focus::Overlay);
     }
     if app.input_rect.contains(p) {
         return Some(Focus::Input);
@@ -679,7 +993,7 @@ fn extend_selection_on_scroll(app: &mut App) {
         Some(p) => p,
         None => return,
     };
-    if let Some((line, col)) = selection_pos_for_focus(app, target, pos.x, pos.y) {
+    if let Some((line, col)) = selection_pos_for_pane(app, target, pos.x, pos.y) {
         if let Some(sel) = app.selection.as_mut() {
             sel.end_line = line;
             sel.end_col = col;
@@ -696,27 +1010,23 @@ fn inner_rect(rect: Rect) -> Rect {
     }
 }
 
-fn selection_pos_for_focus(
+fn selection_pos_for_pane(
     app: &App,
-    focus: Focus,
+    pane: Pane,
     x: u16,
     y: u16,
 ) -> Option<(usize, usize)> {
-    let (rect, text, width, scroll) = match focus {
-        Focus::Context => (
-            app.context_rect,
-            &app.context,
-            app.context_width,
-            app.scroll_context,
+    let (rect, text, width, scroll) = match pane {
+        Pane::Chat => (
+            app.chat_rect,
+            app.answer.as_str(),
+            app.chat_width,
+            app.scroll_chat,
         ),
-        Focus::Plan => (app.plan_rect, &app.plan, app.plan_width, app.scroll_plan),
-        Focus::Answer => (
-            app.answer_rect,
-            &app.answer,
-            app.answer_width,
-            app.scroll_answer,
-        ),
-        Focus::Input => return None,
+        Pane::Overlay => {
+            let text = overlay_text(app)?;
+            (app.overlay_rect, text, app.overlay_width, app.scroll_overlay)
+        }
     };
     let inner = inner_rect(rect);
     if x < inner.x || y < inner.y || x >= inner.x + inner.width || y >= inner.y + inner.height {
@@ -739,10 +1049,12 @@ fn start_run(app: &mut App, cmd_tx: &Sender<WorkerCommand>) -> Result<()> {
     let mut context = None;
 
     app.plan.clear();
-    app.scroll_plan = 0;
-    app.scroll_answer = 0;
-    app.auto_follow_plan = true;
-    app.auto_follow_answer = true;
+    app.scroll_chat = 0;
+    app.auto_follow_chat = true;
+    app.scroll_overlay = 0;
+    app.auto_follow_overlay = true;
+    app.tools_log.clear();
+    app.pending_tool = None;
 
     if let Some(store_path) = app.args.store_path.as_deref() {
         if app.args.vars.is_empty() {
@@ -753,7 +1065,17 @@ fn start_run(app: &mut App, cmd_tx: &Sender<WorkerCommand>) -> Result<()> {
         let mut var_parts = Vec::new();
         for v in &app.args.vars {
             if let Some(binding) = store.get_var_binding_latest_lossy(v)? {
-                var_parts.push(format!("{}({})", v, binding.chunk_ids.len()));
+                let summary_tokens = estimate_tokens(&binding.summary);
+                if summary_tokens > 0 {
+                    var_parts.push(format!(
+                        "{}({}c,~{}t)",
+                        v,
+                        binding.chunk_ids.len(),
+                        summary_tokens
+                    ));
+                } else {
+                    var_parts.push(format!("{}({}c)", v, binding.chunk_ids.len()));
+                }
             } else {
                 var_parts.push(format!("{}(missing)", v));
             }
@@ -764,11 +1086,34 @@ fn start_run(app: &mut App, cmd_tx: &Sender<WorkerCommand>) -> Result<()> {
             top_k: app.args.top_k.unwrap_or(8),
         };
         let retrieved = retriever.retrieve(&store, &task, &candidates)?;
-        let cfg = ContextBuildConfig {
+        let mut cfg = ContextBuildConfig {
             max_snippets: app.args.max_snippets.unwrap_or(6),
             snippet_chars: app.args.snippet_chars.unwrap_or(800),
         };
-        let ctx = build_context(&store, &app.args.vars, &retrieved, &cfg)?;
+        let mut ctx = build_context(&store, &app.args.vars, &retrieved, &cfg)?;
+        if app.model_ctx > 0 {
+            let budget = ((app.model_ctx as f32) * 0.8) as usize;
+            let mut tokens = estimate_tokens(&ctx);
+            let mut last_tokens = tokens;
+            while tokens > budget {
+                if cfg.max_snippets > 1 {
+                    cfg.max_snippets = cfg.max_snippets.saturating_sub(1);
+                } else if cfg.snippet_chars > 200 {
+                    cfg.snippet_chars = cfg.snippet_chars.saturating_sub(200).max(200);
+                } else {
+                    break;
+                }
+                ctx = build_context(&store, &app.args.vars, &retrieved, &cfg)?;
+                tokens = estimate_tokens(&ctx);
+                if tokens >= last_tokens {
+                    break;
+                }
+                last_tokens = tokens;
+            }
+            if tokens > budget {
+                app.status = format!("Context over budget: {} > {}", tokens, budget);
+            }
+        }
         context = Some(ctx);
     } else {
         app.var_stats = "none".to_string();
@@ -776,11 +1121,17 @@ fn start_run(app: &mut App, cmd_tx: &Sender<WorkerCommand>) -> Result<()> {
 
     if let Some(ctx) = context.as_ref() {
         app.context = ctx.clone();
-        app.scroll_context = 0;
+        if matches!(app.overlay, Some(OverlayKind::Context)) {
+            app.scroll_overlay = 0;
+            app.auto_follow_overlay = true;
+        }
         app.context_tokens_est = estimate_tokens(ctx);
     } else {
         app.context = "No context loaded.".to_string();
-        app.scroll_context = 0;
+        if matches!(app.overlay, Some(OverlayKind::Context)) {
+            app.scroll_overlay = 0;
+            app.auto_follow_overlay = true;
+        }
         app.context_tokens_est = 0;
     }
 
@@ -796,17 +1147,20 @@ fn start_run(app: &mut App, cmd_tx: &Sender<WorkerCommand>) -> Result<()> {
     app.history.push(ChatEntry {
         user: task.clone(),
         answer: String::new(),
+        tools: String::new(),
         stats: String::new(),
     });
     app.current_turn = Some(entry_idx);
     app.update_history_render();
-    app.scroll_answer = max_scroll(&app.answer, app.answer_width);
+    app.scroll_chat = max_scroll(&app.answer, app.chat_width, app.chat_height);
 
     cmd_tx.send(WorkerCommand::Run {
         task,
         context,
         plan_tokens: app.agent_cfg.max_plan_tokens,
         answer_tokens: app.agent_cfg.max_answer_tokens,
+        tool_names: app.tool_names.clone(),
+        tool_schema_text: app.tool_schema_text.clone(),
     })?;
 
     Ok(())
@@ -819,22 +1173,49 @@ fn handle_worker_event(app: &mut App, event: WorkerEvent) -> Result<()> {
             event,
             chunk,
         } => {
+            if matches!(event, StreamEvent::Chunk) {
+                app.spinner_idx = app.spinner_idx.wrapping_add(1);
+            }
             match (target, event) {
                 (StreamTarget::Plan, StreamEvent::Start) => {
                     app.plan.clear();
-                    app.scroll_plan = 0;
-                    app.auto_follow_plan = true;
+                    if matches!(app.overlay, Some(OverlayKind::Plan)) {
+                        app.scroll_overlay = 0;
+                        app.auto_follow_overlay = true;
+                    }
                 }
                 (StreamTarget::Answer, StreamEvent::Start) => {
-                    app.scroll_answer = 0;
-                    app.auto_follow_answer = true;
+                    app.auto_follow_chat = true;
+                }
+                (StreamTarget::Tool, StreamEvent::Start) => {
+                    if matches!(app.overlay, Some(OverlayKind::Tools)) {
+                        app.scroll_overlay = 0;
+                        app.auto_follow_overlay = true;
+                    }
                 }
                 (StreamTarget::Plan, StreamEvent::Chunk) => {
-                    let at_bottom = app.scroll_plan >= max_scroll(&app.plan, app.plan_width);
+                    let at_bottom = app.scroll_overlay
+                        >= max_scroll(&app.plan, app.overlay_width, app.overlay_height);
                     app.plan.push_str(&chunk);
-                    if app.auto_follow_plan || at_bottom {
-                        app.scroll_plan = max_scroll(&app.plan, app.plan_width);
-                        app.auto_follow_plan = true;
+                    if matches!(app.overlay, Some(OverlayKind::Plan))
+                        && (app.auto_follow_overlay || at_bottom)
+                    {
+                        app.scroll_overlay =
+                            max_scroll(&app.plan, app.overlay_width, app.overlay_height);
+                        app.auto_follow_overlay = true;
+                    }
+                }
+                (StreamTarget::Tool, StreamEvent::Chunk) => {
+                    let at_bottom =
+                        app.scroll_overlay
+                            >= max_scroll(&app.tools_log, app.overlay_width, app.overlay_height);
+                    app.tools_log.push_str(&chunk);
+                    if matches!(app.overlay, Some(OverlayKind::Tools))
+                        && (app.auto_follow_overlay || at_bottom)
+                    {
+                        app.scroll_overlay =
+                            max_scroll(&app.tools_log, app.overlay_width, app.overlay_height);
+                        app.auto_follow_overlay = true;
                     }
                 }
                 (StreamTarget::Answer, StreamEvent::Chunk) => {
@@ -842,17 +1223,93 @@ fn handle_worker_event(app: &mut App, event: WorkerEvent) -> Result<()> {
                         Some(i) => i,
                         None => return Ok(()),
                     };
-                    let at_bottom = app.scroll_answer >= max_scroll(&app.answer, app.answer_width);
+                    let at_bottom = app.scroll_chat
+                        >= max_scroll(&app.answer, app.chat_width, app.chat_height);
                     if let Some(entry) = app.history.get_mut(idx) {
                         entry.answer.push_str(&chunk);
                     }
                     app.update_history_render();
-                    if app.auto_follow_answer || at_bottom {
-                        app.scroll_answer = max_scroll(&app.answer, app.answer_width);
-                        app.auto_follow_answer = true;
+                    if app.auto_follow_chat || at_bottom {
+                        app.scroll_chat =
+                            max_scroll(&app.answer, app.chat_width, app.chat_height);
+                        app.auto_follow_chat = true;
                     }
                 }
                 _ => {}
+            }
+        }
+        WorkerEvent::ToolApprovalRequired { id, call, decision } => {
+            app.pending_tool = Some(PendingTool { id, call, decision });
+            app.approval_prompt_active = false;
+            app.approval_prompt.clear();
+            app.focus = Focus::Approval;
+            app.status =
+                "Tool approval required (a/Enter approve, n/Backspace decline, e deny w/prompt)"
+                    .to_string();
+            if let Some(pending) = app.pending_tool.as_ref() {
+                let idx = match app.current_turn {
+                    Some(i) => i,
+                    None => return Ok(()),
+                };
+                let mut buf = String::new();
+                buf.push_str("\nPENDING TOOL:\n");
+                buf.push_str(&format!("name: {}\n", pending.call.name));
+                buf.push_str(&format!("args: {}\n", pending.call.args));
+                buf.push_str(&format!("risk: {:?}\n", pending.decision.risk));
+                if let Some(reason) = pending.decision.reason.as_ref() {
+                    buf.push_str(&format!("reason: {}\n", reason));
+                }
+                if let Some(entry) = app.history.get_mut(idx) {
+                    entry.tools.push_str(&buf);
+                }
+                app.tools_log.push_str("\nPENDING TOOL:\n");
+                app.tools_log.push_str(&format!("name: {}\n", pending.call.name));
+                app.tools_log.push_str(&format!("args: {}\n", pending.call.args));
+                app.tools_log
+                    .push_str(&format!("risk: {:?}\n", pending.decision.risk));
+                if let Some(reason) = pending.decision.reason.as_ref() {
+                    app.tools_log.push_str(&format!("reason: {}\n", reason));
+                }
+                app.update_history_render();
+                let chat_at_bottom =
+                    app.scroll_chat >= max_scroll(&app.answer, app.chat_width, app.chat_height);
+                if app.auto_follow_chat || chat_at_bottom {
+                    app.scroll_chat = max_scroll(&app.answer, app.chat_width, app.chat_height);
+                    app.auto_follow_chat = true;
+                }
+                if matches!(app.overlay, Some(OverlayKind::Tools)) {
+                    app.scroll_overlay = max_scroll(
+                        &app.tools_log,
+                        app.overlay_width,
+                        app.overlay_height,
+                    );
+                    app.auto_follow_overlay = true;
+                }
+            }
+        }
+        WorkerEvent::ToolLog { line } => {
+            app.spinner_idx = app.spinner_idx.wrapping_add(1);
+            let idx = match app.current_turn {
+                Some(i) => i,
+                None => return Ok(()),
+            };
+            let at_bottom = app.scroll_overlay
+                >= max_scroll(&app.tools_log, app.overlay_width, app.overlay_height);
+            if let Some(entry) = app.history.get_mut(idx) {
+                entry.tools.push_str(&line);
+            }
+            app.tools_log.push_str(&line);
+            app.update_history_render();
+            if matches!(app.overlay, Some(OverlayKind::Tools)) && (app.auto_follow_overlay || at_bottom) {
+                app.scroll_overlay =
+                    max_scroll(&app.tools_log, app.overlay_width, app.overlay_height);
+                app.auto_follow_overlay = true;
+            }
+            let chat_at_bottom =
+                app.scroll_chat >= max_scroll(&app.answer, app.chat_width, app.chat_height);
+            if app.auto_follow_chat || chat_at_bottom {
+                app.scroll_chat = max_scroll(&app.answer, app.chat_width, app.chat_height);
+                app.auto_follow_chat = true;
             }
         }
         WorkerEvent::Done {
@@ -862,6 +1319,11 @@ fn handle_worker_event(app: &mut App, event: WorkerEvent) -> Result<()> {
             elapsed_ms,
         } => {
             app.plan = plan.trim().to_string();
+            if matches!(app.overlay, Some(OverlayKind::Plan)) {
+                app.scroll_overlay =
+                    max_scroll(&app.plan, app.overlay_width, app.overlay_height);
+                app.auto_follow_overlay = true;
+            }
             if let Some(idx) = app.current_turn.take() {
                 if let Some(entry) = app.history.get_mut(idx) {
                     entry.answer = answer.trim().to_string();
@@ -884,16 +1346,37 @@ fn handle_worker_event(app: &mut App, event: WorkerEvent) -> Result<()> {
                 }
             }
             app.update_history_render();
+            if app.auto_follow_chat {
+                app.scroll_chat = max_scroll(&app.answer, app.chat_width, app.chat_height);
+            }
             app.is_generating = false;
+            app.spinner_idx = 0;
             if cancelled {
                 app.status = "Cancelled".to_string();
             } else {
                 app.status = "Done".to_string();
             }
+            app.pending_tool = None;
+            if app.focus == Focus::Approval {
+                app.focus = Focus::Input;
+            }
+            if let Some(prompt) = app.pending_followup_prompt.take() {
+                app.task_input = prompt;
+                app.focus = Focus::Input;
+            }
         }
         WorkerEvent::Error(msg) => {
             app.is_generating = false;
+            app.spinner_idx = 0;
             app.status = format!("Error: {}", msg);
+            app.pending_tool = None;
+            if app.focus == Focus::Approval {
+                app.focus = Focus::Input;
+            }
+            if let Some(prompt) = app.pending_followup_prompt.take() {
+                app.task_input = prompt;
+                app.focus = Focus::Input;
+            }
         }
     }
     Ok(())
@@ -904,6 +1387,7 @@ fn worker_loop(
     evt_tx: Sender<WorkerEvent>,
     llm_cfg: LlmConfig,
     base_agent_cfg: CodingAgentConfig,
+    settings: WorkerSettings,
 ) {
     let cancel_flag = llm_cfg.cancel_flag.clone();
     let mut llm = match LlamaCppLlm::load(llm_cfg) {
@@ -913,6 +1397,17 @@ fn worker_loop(
             return;
         }
     };
+    let host = match settings.skills_dir.as_ref() {
+        Some(dir) => match SkillHost::load(dir) {
+            Ok(h) => Some(h),
+            Err(err) => {
+                let _ = evt_tx.send(WorkerEvent::Error(err.to_string()));
+                return;
+            }
+        },
+        None => None,
+    };
+    let mut tool_id: u64 = 1;
 
     while let Ok(cmd) = cmd_rx.recv() {
         match cmd {
@@ -921,7 +1416,10 @@ fn worker_loop(
                 context,
                 plan_tokens,
                 answer_tokens,
+                tool_names,
+                tool_schema_text,
             } => {
+                let mut read_files = std::collections::HashSet::<PathBuf>::new();
                 let mut agent_cfg = base_agent_cfg.clone();
                 agent_cfg.max_plan_tokens = plan_tokens.max(1);
                 agent_cfg.max_answer_tokens = answer_tokens.max(1);
@@ -934,7 +1432,117 @@ fn worker_loop(
                         chunk: chunk.to_string(),
                     });
                 };
-                match agent.run_streaming(&task, context.as_deref(), &mut on_stream) {
+                let mut exec_tool = |call_req: &varctx_proto::agent::ToolCallRequest| -> Result<String> {
+                    let id = tool_id;
+                    tool_id = tool_id.saturating_add(1);
+                    let call = ToolCall {
+                        id,
+                        name: call_req.name.clone(),
+                        args: call_req.args.clone(),
+                    };
+                    let decision = settings.policy.classify(&call);
+                    if !decision.allowed {
+                        let msg = decision
+                            .reason
+                            .clone()
+                            .unwrap_or_else(|| "tool denied".to_string());
+                        let _ = evt_tx.send(WorkerEvent::ToolLog {
+                            line: format!("\nTOOL_DENIED: {} ({})\n", call.name, msg),
+                        });
+                        return Err(anyhow!(msg));
+                    }
+                    if decision.needs_approval {
+                        let _ = evt_tx.send(WorkerEvent::ToolApprovalRequired {
+                            id,
+                            call: call.clone(),
+                            decision: decision.clone(),
+                        });
+                        let approved = wait_for_tool_decision(&cmd_rx, id)?;
+                        if !approved {
+                            let _ = evt_tx.send(WorkerEvent::ToolLog {
+                                line: format!("\nTOOL_REJECTED: {}\n", call.name),
+                            });
+                            return Err(anyhow!("tool rejected by user"));
+                        }
+                    }
+                    let _ = evt_tx.send(WorkerEvent::ToolLog {
+                        line: format!("\nTOOL_RUN: {} {}\n", call.name, call.args),
+                    });
+                    if call.name == "code.exec" {
+                        let out = run_code_exec(&call.args, &settings.policy)?;
+                        let _ = evt_tx.send(WorkerEvent::ToolLog {
+                            line: format!("\nTOOL_RESULT: {}\n", out.trim_end()),
+                        });
+                        return Ok(out.trim().to_string());
+                    }
+                    if call.name == "shell.exec" {
+                        let out = run_shell_exec(&call.args, &settings.policy.workspace_root)?;
+                        let _ = evt_tx.send(WorkerEvent::ToolLog {
+                            line: format!("\nTOOL_RESULT: {}\n", out.trim_end()),
+                        });
+                        return Ok(out.trim().to_string());
+                    }
+                    if call.name == "fs.list" {
+                        let out = list_dir(&call.args, &settings.policy.workspace_root)?;
+                        let _ = evt_tx.send(WorkerEvent::ToolLog {
+                            line: format!("\nTOOL_RESULT: {}\n", out.trim_end()),
+                        });
+                        return Ok(out.trim().to_string());
+                    }
+                    if call.name == "fs.read" {
+                        let path = resolve_path_arg(&call.args, &settings.policy.workspace_root)?;
+                        let out = read_file_at(&path, &call.args)?;
+                        read_files.insert(path);
+                        let _ = evt_tx.send(WorkerEvent::ToolLog {
+                            line: format!("\nTOOL_RESULT: {}\n", out.trim_end()),
+                        });
+                        return Ok(out.trim().to_string());
+                    }
+                    if call.name == "fs.edit" {
+                        let path = resolve_path_arg(&call.args, &settings.policy.workspace_root)?;
+                        if !read_files.contains(&path) {
+                            return Err(anyhow!(
+                                "must read file before edit: {}",
+                                path.display()
+                            ));
+                        }
+                        let out = edit_file_at(&path, &call.args)?;
+                        let _ = evt_tx.send(WorkerEvent::ToolLog {
+                            line: format!("\nTOOL_RESULT: {}\n", out.trim_end()),
+                        });
+                        return Ok(out.trim().to_string());
+                    }
+                    let host = host.as_ref().ok_or_else(|| anyhow!("no skills loaded"))?;
+                    let result = host.run_tool(
+                        &call,
+                        settings.tool_timeout,
+                        &settings.policy.workspace_root,
+                    )?;
+                    let mut out = String::new();
+                    if !result.stdout.trim().is_empty() {
+                        out.push_str(&result.stdout);
+                    }
+                    if !result.stderr.trim().is_empty() {
+                        out.push_str("\nSTDERR:\n");
+                        out.push_str(&result.stderr);
+                    }
+                    if let Some(err) = result.error.as_ref() {
+                        out.push_str("\nERROR:\n");
+                        out.push_str(err);
+                    }
+                    let _ = evt_tx.send(WorkerEvent::ToolLog {
+                        line: format!("\nTOOL_RESULT: {}\n", out.trim_end()),
+                    });
+                    Ok(out.trim().to_string())
+                };
+                match agent.run_with_tools_streaming(
+                    &task,
+                    context.as_deref(),
+                    &tool_names,
+                    Some(tool_schema_text.as_str()),
+                    &mut exec_tool,
+                    &mut on_stream,
+                ) {
                     Ok(result) => {
                         let cancelled = cancel_flag
                             .as_ref()
@@ -952,8 +1560,29 @@ fn worker_loop(
                     }
                 }
             }
+            WorkerCommand::ToolDecision { .. } => {
+                // Tool approvals are consumed by wait_for_tool_decision.
+            }
             WorkerCommand::Shutdown => {
                 break;
+            }
+        }
+    }
+}
+
+fn wait_for_tool_decision(cmd_rx: &Receiver<WorkerCommand>, id: u64) -> Result<bool> {
+    loop {
+        match cmd_rx.recv()? {
+            WorkerCommand::ToolDecision { id: resp_id, allow } => {
+                if resp_id == id {
+                    return Ok(allow);
+                }
+            }
+            WorkerCommand::Shutdown => {
+                return Err(anyhow!("shutdown"));
+            }
+            WorkerCommand::Run { .. } => {
+                // Ignore nested runs while waiting for approval.
             }
         }
     }
@@ -971,76 +1600,152 @@ fn draw_ui(f: &mut Frame, app: &mut App) {
         .block(Block::default().borders(Borders::BOTTOM));
     f.render_widget(header, outer[0]);
 
-    let body = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(45), Constraint::Percentage(55)])
-        .split(outer[1]);
+    let body = outer[1];
+    let (chat_rect, overlay_rect) = if app.overlay.is_some() {
+        let cols = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(70), Constraint::Percentage(30)])
+            .split(body);
+        (cols[0], cols[1])
+    } else {
+        (body, Rect::default())
+    };
 
-    let right = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(9), Constraint::Min(5)])
-        .split(body[1]);
-
-    app.context_rect = body[0];
-    let context_block = block_with_focus("Context", app.focus == Focus::Context);
-    let context_inner = context_block.inner(app.context_rect);
-    app.context_width = context_inner.width.max(1);
-    app.scroll_context = clamp_scroll(app.scroll_context, &app.context, app.context_width);
-    let context = Paragraph::new(render_lines(
-        &app.context,
-        app.context_width,
-        app.selection.as_ref().filter(|s| s.target == Focus::Context),
-    ))
-        .block(context_block)
-        .scroll((app.scroll_context, 0));
-    f.render_widget(context, body[0]);
-
-    app.plan_rect = right[0];
-    let plan_block = block_with_focus("Plan", app.focus == Focus::Plan);
-    let plan_inner = plan_block.inner(app.plan_rect);
-    app.plan_width = plan_inner.width.max(1);
-    app.scroll_plan = clamp_scroll(app.scroll_plan, &app.plan, app.plan_width);
-    let plan = Paragraph::new(render_lines(
-        &app.plan,
-        app.plan_width,
-        app.selection.as_ref().filter(|s| s.target == Focus::Plan),
-    ))
-        .block(plan_block)
-        .scroll((app.scroll_plan, 0));
-    f.render_widget(plan, right[0]);
-
-    app.answer_rect = right[1];
-    let answer_block = block_with_focus("Answer", app.focus == Focus::Answer);
-    let answer_inner = answer_block.inner(app.answer_rect);
-    app.answer_width = answer_inner.width.max(1);
-    app.scroll_answer = clamp_scroll(app.scroll_answer, &app.answer, app.answer_width);
-    let answer = Paragraph::new(render_lines(
+    app.chat_rect = chat_rect;
+    let chat_block = block_with_focus("Chat", app.focus == Focus::Chat);
+    let chat_inner = chat_block.inner(app.chat_rect);
+    app.chat_width = chat_inner.width.max(1);
+    app.chat_height = chat_inner.height.max(1);
+    app.scroll_chat = clamp_scroll(app.scroll_chat, &app.answer, app.chat_width, app.chat_height);
+    let chat = Paragraph::new(render_lines(
         &app.answer,
-        app.answer_width,
-        app.selection.as_ref().filter(|s| s.target == Focus::Answer),
+        app.chat_width,
+        app.selection.as_ref().filter(|s| s.target == Pane::Chat),
     ))
-        .block(answer_block)
-        .scroll((app.scroll_answer, 0));
-    f.render_widget(answer, right[1]);
+    .block(chat_block)
+    .scroll((app.scroll_chat, 0));
+    f.render_widget(chat, app.chat_rect);
+
+    if let Some(kind) = app.overlay {
+        app.overlay_rect = overlay_rect;
+        let overlay_block = block_with_focus(overlay_title(kind), app.focus == Focus::Overlay);
+        let overlay_inner = overlay_block.inner(app.overlay_rect);
+        app.overlay_width = overlay_inner.width.max(1);
+        app.overlay_height = overlay_inner.height.max(1);
+        let overlay_text = match kind {
+            OverlayKind::Context => app.context.as_str(),
+            OverlayKind::Plan => app.plan.as_str(),
+            OverlayKind::Tools => app.tools_log.as_str(),
+            OverlayKind::Help => HELP_TEXT,
+        };
+        app.scroll_overlay = clamp_scroll(
+            app.scroll_overlay,
+            overlay_text,
+            app.overlay_width,
+            app.overlay_height,
+        );
+        let overlay = Paragraph::new(render_lines(
+            overlay_text,
+            app.overlay_width,
+            app.selection.as_ref().filter(|s| s.target == Pane::Overlay),
+        ))
+        .block(overlay_block)
+        .scroll((app.scroll_overlay, 0));
+        f.render_widget(overlay, app.overlay_rect);
+    } else {
+        app.overlay_rect = Rect::default();
+        app.overlay_width = 1;
+        app.overlay_height = 1;
+        app.scroll_overlay = 0;
+    }
 
     app.input_rect = outer[2];
-    let input_block = block_with_focus("Task Input", app.focus == Focus::Input);
+    let input_block = block_with_focus("Input", app.focus == Focus::Input);
     let input = Paragraph::new(app.task_input.clone())
         .block(input_block)
         .wrap(Wrap { trim: false });
     f.render_widget(input, outer[2]);
+
+    if app.pending_tool.is_some() {
+        draw_approval_modal(f, app);
+    }
 }
 
 fn block_with_focus(title: &str, focused: bool) -> Block<'_> {
     let style = if focused {
-        Style::default().fg(Color::Cyan)
-    } else {
         Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::DarkGray)
     };
     Block::default()
         .borders(Borders::ALL)
         .title(title)
         .border_style(style)
+}
+
+fn draw_approval_modal(f: &mut Frame, app: &App) {
+    let area = centered_rect(70, 50, f.area());
+    f.render_widget(Clear, area);
+    let title = if app.approval_prompt_active {
+        "Deny With Prompt"
+    } else {
+        "Tool Approval"
+    };
+    let block = block_with_focus(title, app.focus == Focus::Approval);
+    let inner = block.inner(area);
+    let text = approval_modal_text(app);
+    let paragraph = Paragraph::new(render_lines(&text, inner.width.max(1), None))
+        .block(block)
+        .wrap(Wrap { trim: false });
+    f.render_widget(paragraph, area);
+}
+
+fn approval_modal_text(app: &App) -> String {
+    let Some(pending) = app.pending_tool.as_ref() else {
+        return String::new();
+    };
+    let mut out = String::new();
+    out.push_str("Tool request:\n");
+    out.push_str(&format!("name: {}\n", pending.call.name));
+    out.push_str(&format!("args: {}\n", pending.call.args));
+    out.push_str(&format!("risk: {:?}\n", pending.decision.risk));
+    if let Some(reason) = pending.decision.reason.as_ref() {
+        out.push_str(&format!("reason: {}\n", reason));
+    }
+    if app.approval_prompt_active {
+        out.push_str("\nDeny with prompt:\n> ");
+        out.push_str(&app.approval_prompt);
+        out.push_str("\n\nEnter = deny + prompt, Esc = cancel");
+    } else {
+        out.push_str("\nApprove: a or Enter\n");
+        out.push_str("Decline: n or Backspace\n");
+        out.push_str("Deny with prompt: e");
+    }
+    out
+}
+
+fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
+    let percent_x = percent_x.min(100).max(10);
+    let percent_y = percent_y.min(100).max(10);
+    let vertical = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage((100 - percent_y) / 2),
+            Constraint::Percentage(percent_y),
+            Constraint::Percentage((100 - percent_y) / 2),
+        ])
+        .split(r);
+    let horizontal = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage((100 - percent_x) / 2),
+            Constraint::Percentage(percent_x),
+            Constraint::Percentage((100 - percent_x) / 2),
+        ])
+        .split(vertical[1]);
+    horizontal[1]
 }
 
 fn header_text(app: &App) -> String {
@@ -1055,28 +1760,52 @@ fn header_text(app: &App) -> String {
     } else {
         app.var_stats.clone()
     };
+    let spinner = if app.is_generating {
+        const FRAMES: [&str; 4] = ["|", "/", "-", "\\"];
+        FRAMES[app.spinner_idx % FRAMES.len()]
+    } else {
+        ""
+    };
+    let status = if app.is_generating && !spinner.is_empty() {
+        format!("{} {}", app.status, spinner)
+    } else {
+        app.status.clone()
+    };
+    let ctx_delta = if app.current_context_delta == 0 {
+        String::new()
+    } else {
+        format!(
+            " ({:+} tok, {:+.1}%)",
+            app.current_context_delta, app.current_context_pct
+        )
+    };
     if app.model_ctx > 0 {
         format!(
-            "Varctx TUI | Store: {} | Vars: {} | Ctx: {}/{} tok | Status: {}",
-            store, vars, app.context_tokens_est, app.model_ctx, app.status
+            "EquiCode TUI | Store: {} | Vars: {} | Mode: {:?} | Ctx: {}/{} tok{} | Status: {}",
+            store,
+            vars,
+            app.exec_mode,
+            app.context_tokens_est,
+            app.model_ctx,
+            ctx_delta,
+            status
         )
     } else {
         format!(
-            "Varctx TUI | Store: {} | Vars: {} | Ctx: {} tok | Status: {}",
-            store, vars, app.context_tokens_est, app.status
+            "EquiCode TUI | Store: {} | Vars: {} | Mode: {:?} | Ctx: {} tok{} | Status: {}",
+            store, vars, app.exec_mode, app.context_tokens_est, ctx_delta, status
         )
     }
 }
 
-fn clamp_scroll(current: u16, text: &str, width: u16) -> u16 {
-    let lines = wrapped_line_count(text, width).max(1);
-    let max_scroll = lines.saturating_sub(1) as u16;
-    current.min(max_scroll)
+fn clamp_scroll(current: u16, text: &str, width: u16, height: u16) -> u16 {
+    current.min(max_scroll(text, width, height))
 }
 
-fn max_scroll(text: &str, width: u16) -> u16 {
+fn max_scroll(text: &str, width: u16, height: u16) -> u16 {
     let lines = wrapped_line_count(text, width).max(1);
-    lines.saturating_sub(1) as u16
+    let visible = height.max(1) as usize;
+    lines.saturating_sub(visible) as u16
 }
 
 fn wrapped_line_count(text: &str, width: u16) -> usize {
@@ -1220,4 +1949,22 @@ fn parse_model_path(override_path: Option<String>) -> Option<String> {
         return Some(default.to_string());
     }
     None
+}
+
+fn parse_exec_mode(mode: Option<String>) -> ExecMode {
+    match mode.as_deref() {
+        Some("confirm") => ExecMode::Confirm,
+        Some("paranoid") => ExecMode::Paranoid,
+        _ => ExecMode::Yolo,
+    }
+}
+
+fn resolve_skills_dir(override_dir: Option<&str>) -> Option<PathBuf> {
+    let dir = override_dir?;
+    let p = PathBuf::from(dir);
+    if p.exists() {
+        Some(p)
+    } else {
+        None
+    }
 }

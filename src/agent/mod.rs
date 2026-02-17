@@ -1,4 +1,6 @@
-use anyhow::Result;
+use anyhow::{anyhow, Result};
+use serde_json::Value;
+use std::collections::HashSet;
 
 use crate::llm::{Llm, Prompt};
 use crate::pipeline::assertions::{run_with_retry, Attempt, Constraint};
@@ -9,10 +11,14 @@ pub mod context;
 pub struct CodingAgentConfig {
     pub plan_system: String,
     pub answer_system: String,
+    pub action_system: String,
     pub max_plan_tokens: usize,
     pub max_answer_tokens: usize,
+    pub max_action_tokens: usize,
+    pub max_tool_iters: usize,
     pub plan_constraints: Vec<Constraint>,
     pub answer_constraints: Vec<Constraint>,
+    pub action_constraints: Vec<Constraint>,
 }
 
 impl Default for CodingAgentConfig {
@@ -21,10 +27,15 @@ impl Default for CodingAgentConfig {
             plan_system: "You are a planning module. Produce a short, actionable plan.".to_string(),
             answer_system: "You are a coding agent. Use the plan and context to respond."
                 .to_string(),
+            action_system: "You are a coding agent with tool access. Output either:\n- FINAL: <final response>\n- a JSON object: {\"tool\": \"tool.name\", \"args\": {...}}\nReturn only one of those.\n\nIf the user asks to run/execute a command, read/write/edit files, or otherwise perform an action, you MUST output a tool JSON call (not FINAL). Do not reply with instructions for the user to run tools. Use one tool call per turn; after results are returned, you may call more tools or output FINAL.\nOnly use tools listed in Available tools. Do not invent tool names.\n\nBuilt-in tools:\n- fs.list {\"path\": \"...\", \"recursive\": bool?, \"max_entries\": int?}\n- fs.read {\"path\": \"...\", \"start_line\": int?, \"end_line\": int?, \"head\": int?, \"tail\": int?}\n- fs.edit {\"path\": \"...\", \"start_line\": int, \"end_line\": int, \"content\": \"...\"} OR {\"path\": \"...\", \"old\": \"...\", \"new\": \"...\"}\n- shell.exec {\"cmd\": \"echo\", \"args\": [\"Hello\"], \"cwd\": \"...\"?, \"timeout_ms\": int?} (cmd must be a bare command, no spaces)\nRequirement: call fs.read on a file before fs.edit on that file.\n\nTool note: code.exec runs Monty (Python subset) code with args {\"code\": \"...\", \"inputs\": {..}, \"input_names\": [..]}.\nMonty helpers: read(path), write(path, content), list(path), grep(path, pattern), exists(path)."
+                .to_string(),
             max_plan_tokens: 256,
             max_answer_tokens: 512,
+            max_action_tokens: 256,
+            max_tool_iters: 6,
             plan_constraints: Vec::new(),
             answer_constraints: Vec::new(),
+            action_constraints: Vec::new(),
         }
     }
 }
@@ -42,10 +53,23 @@ pub struct AgentResult {
     pub answer_attempts: Vec<Attempt>,
 }
 
+#[derive(Debug, Clone)]
+pub struct ToolCallRequest {
+    pub name: String,
+    pub args: Value,
+}
+
+#[derive(Debug, Clone)]
+enum AgentAction {
+    Final(String),
+    Tool(ToolCallRequest),
+}
+
 #[derive(Debug, Clone, Copy)]
 pub enum StreamTarget {
     Plan,
     Answer,
+    Tool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -118,6 +142,215 @@ impl<'a> CodingAgent<'a> {
             answer_attempts,
         })
     }
+
+    pub fn run_with_tools_streaming(
+        &mut self,
+        task: &str,
+        context: Option<&str>,
+        tool_names: &[String],
+        tool_schema_text: Option<&str>,
+        exec_tool: &mut dyn FnMut(&ToolCallRequest) -> Result<String>,
+        on_stream: &mut dyn FnMut(StreamTarget, StreamEvent, &str),
+    ) -> Result<AgentResult> {
+        if tool_names.is_empty() {
+            return self.run_streaming(task, context, on_stream);
+        }
+        let (plan, plan_attempts) = run_with_retry(&self.config.plan_constraints, |attempts| {
+            let prompt = build_plan_prompt(task, context, attempts, &self.config);
+            on_stream(StreamTarget::Plan, StreamEvent::Start, "");
+            let out = self.llm.generate_stream(
+                &prompt,
+                self.config.max_plan_tokens,
+                &mut |chunk| on_stream(StreamTarget::Plan, StreamEvent::Chunk, chunk),
+            )?;
+            on_stream(StreamTarget::Plan, StreamEvent::End, "");
+            Ok(out)
+        })?;
+
+        let mut attempts: Vec<Attempt> = Vec::new();
+        let mut tool_context = String::new();
+        let mut final_hint: Option<String> = None;
+        let required_tools = required_tools_from_task(task, tool_names);
+        let mut remaining_required: HashSet<String> =
+            required_tools.iter().cloned().collect();
+        if !required_tools.is_empty() {
+            tool_context.push_str("REQUIRED_TOOLS:\n");
+            for tool in &required_tools {
+                tool_context.push_str("- ");
+                tool_context.push_str(tool);
+                tool_context.push('\n');
+            }
+            tool_context.push('\n');
+        }
+
+        for _ in 0..self.config.max_tool_iters.max(1) {
+            let prompt = build_action_prompt(
+                task,
+                context,
+                &plan,
+                &tool_context,
+                tool_names,
+                tool_schema_text,
+                &attempts,
+                &self.config,
+            );
+            on_stream(StreamTarget::Tool, StreamEvent::Start, "");
+            let action_out = self.llm.generate_stream(
+                &prompt,
+                self.config.max_action_tokens,
+                &mut |chunk| on_stream(StreamTarget::Tool, StreamEvent::Chunk, chunk),
+            )?;
+            on_stream(StreamTarget::Tool, StreamEvent::End, "");
+
+            if let Some(msg) = first_constraint_error(&self.config.action_constraints, &action_out) {
+                attempts.push(Attempt {
+                    output: action_out,
+                    error_msg: msg.clone(),
+                });
+                tool_context.push_str("\nACTION_FAILED:\n");
+                tool_context.push_str(&msg);
+                tool_context.push('\n');
+                continue;
+            }
+
+            match parse_action(&action_out) {
+                Ok(AgentAction::Final(answer)) => {
+                    if !remaining_required.is_empty() {
+                        let mut remaining: Vec<String> =
+                            remaining_required.iter().cloned().collect();
+                        remaining.sort();
+                        let msg = format!(
+                            "must call required tools before FINAL: {}",
+                            remaining.join(", ")
+                        );
+                        attempts.push(Attempt {
+                            output: action_out,
+                            error_msg: msg.clone(),
+                        });
+                        tool_context.push_str("\nTOOL_ERROR:\n");
+                        tool_context.push_str(&msg);
+                        tool_context.push('\n');
+                        continue;
+                    }
+                    final_hint = Some(answer);
+                    break;
+                }
+                Ok(AgentAction::Tool(call)) => {
+                    if !tool_names.iter().any(|name| name == &call.name) {
+                        let msg = format!(
+                            "unknown tool: {}. Use one of: {}",
+                            call.name,
+                            tool_names.join(", ")
+                        );
+                        attempts.push(Attempt {
+                            output: action_out,
+                            error_msg: msg.clone(),
+                        });
+                        tool_context.push_str("\nTOOL_ERROR:\n");
+                        tool_context.push_str(&msg);
+                        tool_context.push('\n');
+                        continue;
+                    }
+                    remaining_required.remove(&call.name);
+                    match exec_tool(&call) {
+                        Ok(result) => {
+                            tool_context.push_str("\nTOOL_CALL:\n");
+                            tool_context.push_str(&format!("{} {}\n", call.name, call.args));
+                            tool_context.push_str("TOOL_RESULT:\n");
+                            tool_context.push_str(&result);
+                            tool_context.push('\n');
+                        }
+                        Err(err) => {
+                            attempts.push(Attempt {
+                                output: action_out,
+                                error_msg: err.to_string(),
+                            });
+                            tool_context.push_str("\nTOOL_ERROR:\n");
+                            tool_context.push_str(&err.to_string());
+                            tool_context.push('\n');
+                        }
+                    }
+                }
+                Err(err) => {
+                    attempts.push(Attempt {
+                        output: action_out,
+                        error_msg: err.to_string(),
+                    });
+                }
+            }
+        }
+
+        let Some(final_hint) = final_hint else {
+            return Err(anyhow!(
+                "tool loop exceeded max iterations ({})",
+                self.config.max_tool_iters
+            ));
+        };
+
+        let (answer, answer_attempts) =
+            run_with_retry(&self.config.answer_constraints, |attempts| {
+                let prompt = build_answer_prompt_with_tools(
+                    task,
+                    context,
+                    &plan,
+                    &tool_context,
+                    Some(&final_hint),
+                    attempts,
+                    &self.config,
+                );
+                on_stream(StreamTarget::Answer, StreamEvent::Start, "");
+                let out = self.llm.generate_stream(
+                    &prompt,
+                    self.config.max_answer_tokens,
+                    &mut |chunk| on_stream(StreamTarget::Answer, StreamEvent::Chunk, chunk),
+                )?;
+                on_stream(StreamTarget::Answer, StreamEvent::End, "");
+                Ok(out)
+            })?;
+
+        Ok(AgentResult {
+            plan,
+            answer,
+            plan_attempts,
+            answer_attempts,
+        })
+    }
+}
+
+fn required_tools_from_task(task: &str, tool_names: &[String]) -> Vec<String> {
+    let task_lc = task.to_lowercase();
+    let mut out = Vec::new();
+    for name in tool_names {
+        let name_lc = name.to_lowercase();
+        if task_lc.contains(&name_lc) {
+            out.push(name.clone());
+        }
+    }
+
+    let has_shell_hint = task_lc.contains("shell")
+        || task_lc.contains("terminal")
+        || task_lc.contains("bash")
+        || task_lc.contains("run command")
+        || task_lc.contains("execute command");
+    if has_shell_hint && tool_names.iter().any(|t| t == "shell.exec") {
+        if !out.iter().any(|t| t == "shell.exec") {
+            out.push("shell.exec".to_string());
+        }
+    }
+
+    let has_code_hint = task_lc.contains("code tool")
+        || task_lc.contains("code tools")
+        || task_lc.contains("code.exec")
+        || task_lc.contains("monty")
+        || task_lc.contains("python")
+        || task_lc.contains("run code");
+    if has_code_hint && tool_names.iter().any(|t| t == "code.exec") {
+        if !out.iter().any(|t| t == "code.exec") {
+            out.push("code.exec".to_string());
+        }
+    }
+
+    out
 }
 
 fn render_retry_feedback(attempts: &[Attempt]) -> String {
@@ -132,6 +365,125 @@ fn render_retry_feedback(attempts: &[Attempt]) -> String {
     }
     out.push('\n');
     out
+}
+
+fn build_action_prompt(
+    task: &str,
+    context: Option<&str>,
+    plan: &str,
+    tool_context: &str,
+    tool_names: &[String],
+    tool_schema_text: Option<&str>,
+    attempts: &[Attempt],
+    config: &CodingAgentConfig,
+) -> Prompt {
+    let mut system = config.action_system.clone();
+    if !tool_names.is_empty() {
+        system.push_str("\nAvailable tools:\n");
+        for name in tool_names {
+            system.push_str("- ");
+            system.push_str(name);
+            system.push('\n');
+        }
+    }
+    if let Some(schema_text) = tool_schema_text {
+        if !schema_text.trim().is_empty() {
+            system.push('\n');
+            system.push_str("Tool schemas:\n");
+            system.push_str(schema_text.trim());
+            system.push('\n');
+        }
+    }
+
+    let mut user = String::new();
+    user.push_str("TASK:\n");
+    user.push_str(task);
+    user.push_str("\n\nPLAN:\n");
+    user.push_str(plan.trim());
+    user.push('\n');
+
+    if let Some(ctx) = context {
+        user.push_str("\nCONTEXT:\n");
+        user.push_str(ctx.trim());
+        user.push('\n');
+    }
+
+    if !tool_context.trim().is_empty() {
+        user.push_str("\nTOOL_LOG:\n");
+        user.push_str(tool_context.trim());
+        user.push('\n');
+    }
+
+    let retry = render_retry_feedback(attempts);
+    if !retry.is_empty() {
+        user.push('\n');
+        user.push_str(&retry);
+    }
+
+    user.push_str("\nINSTRUCTION:\nOutput FINAL: <answer> or a tool JSON object only.\n");
+
+    Prompt {
+        system: Some(system),
+        user,
+    }
+}
+
+fn parse_action(output: &str) -> Result<AgentAction> {
+    let trimmed = output.trim();
+    if let Some(final_idx) = trimmed.find("FINAL:") {
+        let answer = trimmed[final_idx + "FINAL:".len()..].trim().to_string();
+        if !answer.is_empty() {
+            return Ok(AgentAction::Final(answer));
+        }
+    }
+
+    if let Some(json) = extract_json_object(trimmed) {
+        let value: Value = serde_json::from_str(&json)?;
+        let name = value
+            .get("tool")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("tool json missing 'tool' field"))?
+            .to_string();
+        let args = value.get("args").cloned().unwrap_or(Value::Null);
+        return Ok(AgentAction::Tool(ToolCallRequest { name, args }));
+    }
+
+    Err(anyhow!("output did not contain FINAL or tool json"))
+}
+
+fn extract_json_object(text: &str) -> Option<String> {
+    let start = text.find('{')?;
+    let mut depth = 0;
+    for (i, ch) in text[start..].char_indices() {
+        match ch {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    let end = start + i + 1;
+                    return Some(text[start..end].to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn first_constraint_error(constraints: &[Constraint], output: &str) -> Option<String> {
+    for c in constraints {
+        let ok = (c.check)(output);
+        if !ok && matches!(c.kind, crate::pipeline::assertions::ConstraintKind::Assert) {
+            return Some(c.message.clone());
+        }
+    }
+    for c in constraints {
+        let ok = (c.check)(output);
+        if !ok && matches!(c.kind, crate::pipeline::assertions::ConstraintKind::Suggest) {
+            return Some(c.message.clone());
+        }
+    }
+    None
 }
 
 pub(crate) fn build_plan_prompt(
@@ -175,6 +527,45 @@ pub(crate) fn build_answer_prompt(
         if !ctx.trim().is_empty() {
             user.push_str("\n\nCONTEXT:\n");
             user.push_str(ctx);
+        }
+    }
+    user.push_str("\n\nINSTRUCTION:\nProduce the best next response.\n");
+
+    Prompt {
+        system: Some(config.answer_system.clone()),
+        user,
+    }
+}
+
+fn build_answer_prompt_with_tools(
+    task: &str,
+    context: Option<&str>,
+    plan: &str,
+    tool_context: &str,
+    draft: Option<&str>,
+    attempts: &[Attempt],
+    config: &CodingAgentConfig,
+) -> Prompt {
+    let mut user = String::new();
+    user.push_str(&render_retry_feedback(attempts));
+    user.push_str("TASK:\n");
+    user.push_str(task);
+    user.push_str("\n\nPLAN:\n");
+    user.push_str(plan);
+    if let Some(ctx) = context {
+        if !ctx.trim().is_empty() {
+            user.push_str("\n\nCONTEXT:\n");
+            user.push_str(ctx);
+        }
+    }
+    if !tool_context.trim().is_empty() {
+        user.push_str("\n\nTOOL_LOG:\n");
+        user.push_str(tool_context.trim());
+    }
+    if let Some(draft) = draft {
+        if !draft.trim().is_empty() {
+            user.push_str("\n\nDRAFT:\n");
+            user.push_str(draft.trim());
         }
     }
     user.push_str("\n\nINSTRUCTION:\nProduce the best next response.\n");
