@@ -1,3 +1,5 @@
+pub mod openrouter;
+
 use anyhow::{anyhow, Result};
 use encoding_rs::UTF_8;
 use std::mem::ManuallyDrop;
@@ -17,6 +19,12 @@ use llama_cpp_2::sampling::LlamaSampler;
 pub struct Prompt {
     pub system: Option<String>,
     pub user: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct ConvMessage {
+    pub role: String,
+    pub content: String,
 }
 
 impl Prompt {
@@ -42,6 +50,31 @@ pub trait Llm {
             on_token(&out);
         }
         Ok(out)
+    }
+
+    /// Multi-turn generation. Default strips assistant turns and calls generate_stream
+    /// with the last user message. Override for proper multi-turn support.
+    fn generate_messages_stream(
+        &mut self,
+        messages: &[ConvMessage],
+        max_tokens: usize,
+        on_token: &mut dyn FnMut(&str),
+    ) -> Result<String> {
+        let system_content = messages
+            .iter()
+            .find(|m| m.role == "system")
+            .map(|m| m.content.clone());
+        let user_content = messages
+            .iter()
+            .rev()
+            .find(|m| m.role == "user")
+            .map(|m| m.content.clone())
+            .unwrap_or_default();
+        let prompt = Prompt {
+            system: system_content,
+            user: user_content,
+        };
+        self.generate_stream(&prompt, max_tokens, on_token)
     }
 }
 
@@ -270,6 +303,90 @@ impl Llm for LlamaCppLlm {
             }
         } else {
             (fallback_prompt(system_msg.as_deref(), &prompt.user), AddBos::Always)
+        };
+
+        let tokens = self.model().str_to_token(&prompt_text, add_bos)?;
+        if tokens.is_empty() {
+            return Ok(String::new());
+        }
+
+        let (mut n_past, mut sample_idx) = self.decode_prompt(&tokens)?;
+
+        let mut sampler = if self.config.temperature <= 0.0 {
+            LlamaSampler::greedy()
+        } else {
+            LlamaSampler::chain_simple([
+                LlamaSampler::top_k(self.config.top_k),
+                LlamaSampler::top_p(self.config.top_p, 1),
+                LlamaSampler::temp(self.config.temperature),
+                LlamaSampler::dist(self.config.seed),
+            ])
+        };
+
+        let mut decoder = UTF_8.new_decoder();
+        let mut out = String::new();
+
+        for _ in 0..max_tokens {
+            if let Some(flag) = &self.cancel_flag {
+                if flag.load(Ordering::SeqCst) {
+                    break;
+                }
+            }
+            let token = sampler.sample(&self.ctx, sample_idx);
+            sampler.accept(token);
+            sample_idx = 0;
+
+            if token == self.model().token_eos() {
+                break;
+            }
+
+            let piece = self.model().token_to_piece(token, &mut decoder, false, None)?;
+            if !piece.is_empty() {
+                on_token(&piece);
+            }
+            out.push_str(&piece);
+
+            let mut batch = LlamaBatch::new(1, 1);
+            batch.add(token, n_past, &[0], true)?;
+            self.ctx.decode(&mut batch)?;
+            n_past += 1;
+        }
+
+        Ok(out)
+    }
+
+    fn generate_messages_stream(
+        &mut self,
+        messages: &[ConvMessage],
+        max_tokens: usize,
+        on_token: &mut dyn FnMut(&str),
+    ) -> Result<String> {
+        self.ctx.clear_kv_cache();
+
+        let (prompt_text, add_bos) = if self.config.use_chat_template {
+            if let Ok(tmpl) = self.model().chat_template(None) {
+                let mut chat_msgs = Vec::new();
+                for msg in messages {
+                    if let Ok(m) = LlamaChatMessage::new(msg.role.clone(), msg.content.clone()) {
+                        chat_msgs.push(m);
+                    }
+                }
+                if let Ok(rendered) = self.model().apply_chat_template(&tmpl, &chat_msgs, true) {
+                    (rendered, AddBos::Never)
+                } else {
+                    let sys = messages.iter().find(|m| m.role == "system").map(|m| m.content.as_str());
+                    let user = messages.iter().rev().find(|m| m.role == "user").map(|m| m.content.as_str()).unwrap_or("");
+                    (fallback_prompt(sys, user), AddBos::Always)
+                }
+            } else {
+                let sys = messages.iter().find(|m| m.role == "system").map(|m| m.content.as_str());
+                let user = messages.iter().rev().find(|m| m.role == "user").map(|m| m.content.as_str()).unwrap_or("");
+                (fallback_prompt(sys, user), AddBos::Always)
+            }
+        } else {
+            let sys = messages.iter().find(|m| m.role == "system").map(|m| m.content.as_str());
+            let user = messages.iter().rev().find(|m| m.role == "user").map(|m| m.content.as_str()).unwrap_or("");
+            (fallback_prompt(sys, user), AddBos::Always)
         };
 
         let tokens = self.model().str_to_token(&prompt_text, add_bos)?;
