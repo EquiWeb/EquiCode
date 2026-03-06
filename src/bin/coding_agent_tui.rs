@@ -122,9 +122,9 @@ fn main() -> Result<()> {
             tool_names = tool_specs.iter().map(|t| t.name.clone()).collect();
         }
     }
-    for builtin in ["code.exec", "fs.list", "fs.read", "fs.edit", "shell.exec"] {
-        if !tool_names.iter().any(|t| t == builtin) {
-            tool_names.push(builtin.to_string());
+    for def in varctx_proto::agent::BUILTIN_TOOLS {
+        if !tool_names.iter().any(|t| t == def.name) {
+            tool_names.push(def.name.to_string());
         }
     }
 
@@ -289,6 +289,8 @@ enum WorkerCommand {
         tool_schema_text: String,
         user_turn_only: bool,
         disable_plan: bool,
+        enforce_todos: bool,
+        max_todo_interventions: Option<usize>,
     },
     ToolDecision {
         id: u64,
@@ -327,6 +329,7 @@ enum WorkerEvent {
     ModelsReady(Vec<OpenRouterModel>),
     SkillInstalled { name: String },
     SkillInstallError(String),
+    TodosUpdated(Vec<TodoItem>),
 }
 
 struct WorkerSettings {
@@ -391,6 +394,7 @@ struct App {
     settings_buffer: String,
     // Experiments modal state
     experiments_cursor: usize,
+    experiments_number_buffer: String, // editable limit for enforce_todos
     // Model picker state
     openrouter_models: Option<Vec<OpenRouterModel>>,
     model_filter: String,
@@ -399,6 +403,8 @@ struct App {
     skills_url: String,
     skills_list: Vec<String>,
     skills_status: String,
+    // Todo tracking (mirrored from worker)
+    todos: Vec<TodoItem>,
 }
 
 impl App {
@@ -412,6 +418,9 @@ impl App {
         let task_input = args.preset_task.clone().unwrap_or_default();
         let exec_mode_str = args.exec_mode.clone().unwrap_or_else(|| config.exec_mode.clone());
         let exec_mode = parse_exec_mode(Some(exec_mode_str));
+        let experiments_number_buffer = config.experiments.max_todo_interventions
+            .map(|n| n.to_string())
+            .unwrap_or_default();
         let mut app = Self {
             config,
             args,
@@ -461,12 +470,14 @@ impl App {
             settings_focus: 0,
             settings_buffer: String::new(),
             experiments_cursor: 0,
+            experiments_number_buffer,
             openrouter_models: None,
             model_filter: String::new(),
             model_selected: 0,
             skills_url: String::new(),
             skills_list: Vec::new(),
             skills_status: String::new(),
+            todos: Vec::new(),
         };
         app.history.push(ChatEntry {
             user: "Quick Start".to_string(),
@@ -590,6 +601,13 @@ struct PendingTool {
 }
 
 #[derive(Debug, Clone)]
+struct TodoItem {
+    id: u64,
+    task: String,
+    completed: bool,
+}
+
+#[derive(Debug, Clone)]
 struct Selection {
     target: Pane,
     start_line: usize,
@@ -701,6 +719,7 @@ Commands:
 /ctx       Context window visualization
 /exp       Experiments (user-turn-only etc.)
 /clear     Clear chat + history
+/todos     Show TODO list in chat
 
 Keys:
 Tab / Shift+Tab  Cycle focus
@@ -816,6 +835,11 @@ fn open_modal_overlay(app: &mut App, kind: OverlayKind, cmd_tx: &Sender<WorkerCo
         OverlayKind::SkillsManager => {
             app.skills_list = list_installed_skills(&app.config);
             app.skills_status.clear();
+        }
+        OverlayKind::Experiments => {
+            app.experiments_number_buffer = app.config.experiments.max_todo_interventions
+                .map(|n| n.to_string())
+                .unwrap_or_default();
         }
         _ => {}
     }
@@ -981,6 +1005,29 @@ fn handle_command(app: &mut App, input: &str, cmd_tx: &Sender<WorkerCommand>) ->
             app.context_breakdown = ContextBreakdown::default();
             app.status = "Chat cleared".to_string();
             let _ = cmd_tx.send(WorkerCommand::ClearHistory);
+        }
+        "todos" | "todo" => {
+            let mut text = String::from("TODOs this session:\n");
+            if app.todos.is_empty() {
+                text.push_str("  (none)\n");
+            } else {
+                for t in &app.todos {
+                    let mark = if t.completed { "✓" } else { "○" };
+                    text.push_str(&format!("  {} [{}] {}\n", mark, t.id, t.task));
+                }
+                let pending = app.todos.iter().filter(|t| !t.completed).count();
+                text.push_str(&format!("\n{} pending, {} completed",
+                    pending, app.todos.len() - pending));
+            }
+            app.history.push(ChatEntry {
+                user: "/todos".to_string(),
+                answer: text,
+                tools: String::new(),
+                stats: String::new(),
+            });
+            app.update_history_render();
+            app.scroll_chat = max_scroll(&app.answer, app.chat_width, app.chat_height);
+            app.status = "TODOs shown in chat".to_string();
         }
         _ => {
             app.status = format!("Unknown command: /{}", cmd);
@@ -1279,7 +1326,7 @@ fn handle_experiments_key(
     key: KeyEvent,
     cmd_tx: &Sender<WorkerCommand>,
 ) -> Result<bool> {
-    const EXP_COUNT: usize = 2;
+    const EXP_COUNT: usize = 3;
     match key.code {
         KeyCode::Esc | KeyCode::Char('q') => {
             app.overlay = None;
@@ -1299,10 +1346,27 @@ fn handle_experiments_key(
             match app.experiments_cursor {
                 0 => app.config.experiments.user_turn_only = !app.config.experiments.user_turn_only,
                 1 => app.config.experiments.disable_plan_phase = !app.config.experiments.disable_plan_phase,
+                2 => app.config.experiments.enforce_todos = !app.config.experiments.enforce_todos,
                 _ => {}
             }
         }
+        // When cursor is on enforce_todos (item 2), let the user edit the limit inline
+        KeyCode::Backspace if app.experiments_cursor == 2 => {
+            app.experiments_number_buffer.pop();
+        }
+        KeyCode::Char(c) if app.experiments_cursor == 2 && c.is_ascii_digit()
+            && !key.modifiers.contains(KeyModifiers::CONTROL) =>
+        {
+            app.experiments_number_buffer.push(c);
+        }
         KeyCode::Char('s') => {
+            // Parse and save the intervention limit
+            app.config.experiments.max_todo_interventions =
+                if app.experiments_number_buffer.trim().is_empty() {
+                    None
+                } else {
+                    app.experiments_number_buffer.trim().parse::<usize>().ok().map(|n| n.max(1))
+                };
             let _ = app.config.save();
             let _ = cmd_tx.send(WorkerCommand::Reconfigure(app.config.clone()));
             app.overlay = None;
@@ -1643,6 +1707,8 @@ fn start_run(app: &mut App, cmd_tx: &Sender<WorkerCommand>) -> Result<()> {
         tool_schema_text: app.tool_schema_text.clone(),
         user_turn_only: app.config.experiments.user_turn_only,
         disable_plan: app.config.experiments.disable_plan_phase,
+        enforce_todos: app.config.experiments.enforce_todos,
+        max_todo_interventions: app.config.experiments.max_todo_interventions,
     })?;
 
     Ok(())
@@ -1835,6 +1901,9 @@ fn handle_worker_event(app: &mut App, event: WorkerEvent) -> Result<()> {
             app.skills_status = format!("Error: {}", msg);
             app.status = format!("Skill install error: {}", msg);
         }
+        WorkerEvent::TodosUpdated(items) => {
+            app.todos = items;
+        }
     }
     Ok(())
 }
@@ -1861,6 +1930,8 @@ fn worker_loop(
     let mut host: Option<SkillHost> = settings.skills_dir.as_ref().and_then(|d| SkillHost::load(d).ok());
     let mut tool_id: u64 = 1;
     let mut conv_history: Vec<ConvMessage> = Vec::new();
+    let todo_items = std::cell::RefCell::new(Vec::<TodoItem>::new());
+    let mut next_todo_id: u64 = 1;
 
     while let Ok(cmd) = cmd_rx.recv() {
         match cmd {
@@ -1873,6 +1944,8 @@ fn worker_loop(
                 tool_schema_text,
                 user_turn_only,
                 disable_plan,
+                enforce_todos,
+                max_todo_interventions,
             } => {
                 let Some(llm) = llm.as_mut() else {
                     let _ = evt_tx.send(WorkerEvent::Error(
@@ -1938,6 +2011,36 @@ fn worker_loop(
                     let _ = evt_tx2.send(WorkerEvent::ToolLog {
                         line: format!("\nTOOL_RUN: {} {}\n", call.name, call.args),
                     });
+                    if call.name == "todo.create" {
+                        let task_text = call.args.get("task").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+                        if task_text.is_empty() {
+                            return Err(anyhow!("todo.create requires {{\"task\": \"description\"}}"));
+                        }
+                        let id = next_todo_id;
+                        next_todo_id += 1;
+                        todo_items.borrow_mut().push(TodoItem { id, task: task_text.clone(), completed: false });
+                        let snap = todo_items.borrow().clone();
+                        let _ = evt_tx2.send(WorkerEvent::TodosUpdated(snap));
+                        let result = format!("Created TODO #{}: {}", id, task_text);
+                        let _ = evt_tx2.send(WorkerEvent::ToolLog { line: format!("\nTOOL_RESULT: {}\n", result) });
+                        return Ok(result);
+                    }
+                    if call.name == "todo.complete" {
+                        let id = call.args.get("id").and_then(|v| v.as_u64()).unwrap_or(0);
+                        let mut todos = todo_items.borrow_mut();
+                        if let Some(t) = todos.iter_mut().find(|t| t.id == id) {
+                            t.completed = true;
+                            let task_text = t.task.clone();
+                            drop(todos);
+                            let snap = todo_items.borrow().clone();
+                            let _ = evt_tx2.send(WorkerEvent::TodosUpdated(snap));
+                            let result = format!("Completed TODO #{}: {}", id, task_text);
+                            let _ = evt_tx2.send(WorkerEvent::ToolLog { line: format!("\nTOOL_RESULT: {}\n", result) });
+                            return Ok(result);
+                        } else {
+                            return Err(anyhow!("TODO #{} not found", id));
+                        }
+                    }
                     if call.name == "code.exec" {
                         let out = run_code_exec(&call.args, policy_ref)?;
                         let _ = evt_tx2.send(WorkerEvent::ToolLog { line: format!("\nTOOL_RESULT: {}\n", out.trim_end()) });
@@ -1985,6 +2088,26 @@ fn worker_loop(
                     Ok(out.trim().to_string())
                 };
 
+                let mut todo_intervention_count: usize = 0;
+                let mut on_final_check = || -> Option<String> {
+                    if !enforce_todos { return None; }
+                    let pending: Vec<TodoItem> = todo_items.borrow().iter().filter(|t| !t.completed).cloned().collect();
+                    if pending.is_empty() { return None; }
+                    if let Some(max) = max_todo_interventions {
+                        if todo_intervention_count >= max { return None; }
+                    }
+                    todo_intervention_count += 1;
+                    let mut msg = format!(
+                        "You have {} pending TODO item(s) that must be completed or marked done before you finish:\n",
+                        pending.len()
+                    );
+                    for t in &pending {
+                        msg.push_str(&format!("  - [id={}] {}\n", t.id, t.task));
+                    }
+                    msg.push_str("\nEither complete the work described above, or call todo.complete {\"id\": <id>} to mark it done, then output FINAL.");
+                    Some(msg)
+                };
+
                 let result = agent.run_with_history_streaming(
                     &task_clone,
                     context.as_deref(),
@@ -1993,6 +2116,7 @@ fn worker_loop(
                     &tool_names,
                     Some(tool_schema_text.as_str()),
                     &mut exec_tool,
+                    &mut on_final_check,
                     &mut on_stream,
                 );
 
@@ -2067,6 +2191,9 @@ fn worker_loop(
             }
             WorkerCommand::ClearHistory => {
                 conv_history.clear();
+                todo_items.borrow_mut().clear();
+                next_todo_id = 1;
+                let _ = evt_tx.send(WorkerEvent::TodosUpdated(vec![]));
             }
             WorkerCommand::Shutdown => break,
         }
@@ -2322,21 +2449,62 @@ fn draw_experiments_modal(f: &mut Frame, app: &App) {
             "Disable plan phase",
             "Skip planning step, go straight to answer generation.",
         ),
+        (
+            app.config.experiments.enforce_todos,
+            "Enforce TODO completion",
+            "If the agent tries to exit while pending TODOs exist, inject a\nSystem reminder forcing it to complete or mark them done first.",
+        ),
     ];
 
-    let mut text = String::new();
-    for (i, (enabled, name, desc)) in experiments.iter().enumerate() {
-        let cursor = if i == app.experiments_cursor { ">" } else { " " };
-        let checkbox = if *enabled { "[x]" } else { "[ ]" };
-        text.push_str(&format!("{} {} {}\n", cursor, checkbox, name));
-        for line in desc.lines() {
-            text.push_str(&format!("      {}\n", line));
-        }
-        text.push('\n');
-    }
-    text.push_str("\nSpace = Toggle | s = Save | Esc = Close");
+    let focused_style = Style::default().fg(Color::Cyan);
+    let dim_style = Style::default().fg(Color::DarkGray);
+    let mut lines: Vec<Line> = Vec::new();
 
-    let para = Paragraph::new(text).wrap(Wrap { trim: false });
+    for (i, (enabled, name, desc)) in experiments.iter().enumerate() {
+        let focused = i == app.experiments_cursor;
+        let cursor_ch = if focused { ">" } else { " " };
+        let checkbox = if *enabled { "[x]" } else { "[ ]" };
+        let row_style = if focused { focused_style } else { Style::default() };
+
+        lines.push(Line::from(vec![
+            Span::styled(format!("{} {} ", cursor_ch, checkbox), row_style),
+            Span::styled(name.to_string(), row_style.add_modifier(Modifier::BOLD)),
+        ]));
+        for line in desc.lines() {
+            lines.push(Line::from(Span::styled(format!("      {}", line), dim_style)));
+        }
+
+        // Sub-field: intervention limit, shown only under enforce_todos (item 2)
+        if i == 2 {
+            let limit_value = if focused {
+                format!("{}{}",
+                    app.experiments_number_buffer,
+                    if focused { "_" } else { "" })
+            } else {
+                app.experiments_number_buffer.clone()
+            };
+            let limit_display = if limit_value.trim_end_matches('_').is_empty() {
+                format!("      Max interventions: [{}]  unlimited", limit_value)
+            } else {
+                format!("      Max interventions: [{}]", limit_value)
+            };
+            let sub_style = if focused { focused_style } else { dim_style };
+            lines.push(Line::from(Span::styled(limit_display, sub_style)));
+            lines.push(Line::from(Span::styled(
+                "      (type a number · blank = unlimited · default = 2)",
+                dim_style,
+            )));
+        }
+
+        lines.push(Line::from(""));
+    }
+
+    lines.push(Line::from(Span::styled(
+        "Space = Toggle  ·  type digits = set limit  ·  s = Save  ·  Esc = Close",
+        dim_style,
+    )));
+
+    let para = Paragraph::new(lines).wrap(Wrap { trim: false });
     f.render_widget(para, inner);
 }
 
@@ -2679,16 +2847,22 @@ fn header_text(app: &App) -> String {
     } else {
         String::new()
     };
+    let pending_todos = app.todos.iter().filter(|t| !t.completed).count();
+    let todos_str = if pending_todos > 0 {
+        format!(" | {} TODO{}", pending_todos, if pending_todos == 1 { "" } else { "s" })
+    } else {
+        String::new()
+    };
     if app.model_ctx > 0 {
         format!(
-            "EquiCode | Backend: {} | Store: {} | Vars: {} | Mode: {:?}{} | Ctx: {}/{}{} | {}",
-            backend_str, store, vars, app.exec_mode, turns_str,
+            "EquiCode | Backend: {} | Store: {} | Vars: {} | Mode: {:?}{}{} | Ctx: {}/{}{} | {}",
+            backend_str, store, vars, app.exec_mode, turns_str, todos_str,
             app.context_tokens_est, app.model_ctx, ctx_delta, status
         )
     } else {
         format!(
-            "EquiCode | Backend: {} | Store: {} | Vars: {} | Mode: {:?}{} | Ctx: {}{} | {}",
-            backend_str, store, vars, app.exec_mode, turns_str,
+            "EquiCode | Backend: {} | Store: {} | Vars: {} | Mode: {:?}{}{} | Ctx: {}{} | {}",
+            backend_str, store, vars, app.exec_mode, turns_str, todos_str,
             app.context_tokens_est, ctx_delta, status
         )
     }

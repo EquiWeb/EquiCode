@@ -125,6 +125,9 @@ enum ToolClass {
 }
 
 fn classify_tool(name: &str) -> (Risk, ToolClass) {
+    if name.starts_with("todo.") {
+        return (Risk::Low, ToolClass::ReadOnly);
+    }
     if name.starts_with("filesystem.read")
         || name.starts_with("filesystem.list")
         || name.starts_with("filesystem.grep")

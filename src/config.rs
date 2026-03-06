@@ -2,6 +2,8 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+fn default_max_todo_interventions() -> Option<usize> { Some(2) }
+
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
 pub enum Backend {
     #[default]
@@ -13,6 +15,14 @@ pub enum Backend {
 pub struct ExperimentConfig {
     pub user_turn_only: bool,
     pub disable_plan_phase: bool,
+    /// When true: if the agent tries to produce a FINAL answer while there are
+    /// pending todos, inject a System reminder and force it to continue.
+    #[serde(default)]
+    pub enforce_todos: bool,
+    /// Max consecutive TODO-enforcement interventions per run before giving up.
+    /// None = unlimited (not recommended). Default = 2.
+    #[serde(default = "default_max_todo_interventions")]
+    pub max_todo_interventions: Option<usize>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]

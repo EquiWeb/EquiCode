@@ -7,6 +7,86 @@ use crate::pipeline::assertions::{run_with_retry, Attempt, Constraint};
 
 pub mod context;
 
+// ─── Built-in tool registry ───────────────────────────────────────────────────
+// Single source of truth for every tool the agent can call natively.
+// Adding a new built-in tool = add one entry here; the action prompt is built
+// automatically.
+
+pub struct BuiltinToolDef {
+    pub name: &'static str,
+    /// Short args sketch shown to the model (JSON-like hint, not strict schema).
+    pub args_hint: &'static str,
+    /// Optional one-line note appended in parentheses after the hint.
+    pub note: Option<&'static str>,
+}
+
+pub const BUILTIN_TOOLS: &[BuiltinToolDef] = &[
+    BuiltinToolDef {
+        name: "fs.list",
+        args_hint: r#"{"path": "...", "recursive": bool?, "max_entries": int?}"#,
+        note: None,
+    },
+    BuiltinToolDef {
+        name: "fs.read",
+        args_hint: r#"{"path": "...", "start_line": int?, "end_line": int?, "head": int?, "tail": int?}"#,
+        note: None,
+    },
+    BuiltinToolDef {
+        name: "fs.edit",
+        args_hint: r#"{"path": "...", "old": "...", "new": "..."}"#,
+        note: Some("call fs.read on the file first"),
+    },
+    BuiltinToolDef {
+        name: "shell.exec",
+        args_hint: r#"{"cmd": "...", "args": [...], "cwd": "..."?, "timeout_ms": int?}"#,
+        note: Some("cmd must be a bare command with no spaces"),
+    },
+    BuiltinToolDef {
+        name: "code.exec",
+        args_hint: r#"{"code": "...", "inputs": {...}, "input_names": [...]}"#,
+        note: Some("runs Monty (Python subset); helpers: read(path), write(path,content), list(path), grep(path,pattern), exists(path)"),
+    },
+    BuiltinToolDef {
+        name: "todo.create",
+        args_hint: r#"{"task": "description"}"#,
+        note: Some("create a TODO to track pending work; returns the assigned id"),
+    },
+    BuiltinToolDef {
+        name: "todo.complete",
+        args_hint: r#"{"id": <number>}"#,
+        note: Some("mark a TODO item as completed"),
+    },
+];
+
+/// Renders the tools section appended to the action system prompt.
+/// `tool_names` is the full list of available tool names (builtin + skill).
+/// `skill_schema_text` is optional extra schema detail for external/skill tools.
+fn render_tools_section(tool_names: &[String], skill_schema_text: Option<&str>) -> String {
+    if tool_names.is_empty() { return String::new(); }
+    let mut out = String::from("\n\nAvailable tools:\n");
+    for name in tool_names {
+        if let Some(def) = BUILTIN_TOOLS.iter().find(|d| d.name == name.as_str()) {
+            out.push_str(&format!("- {} {}", def.name, def.args_hint));
+            if let Some(note) = def.note {
+                out.push_str(&format!("  ({})", note));
+            }
+        } else {
+            out.push_str(&format!("- {}", name));
+        }
+        out.push('\n');
+    }
+    if let Some(schema) = skill_schema_text {
+        if !schema.trim().is_empty() {
+            out.push_str("\nExternal tool schemas:\n");
+            out.push_str(schema.trim());
+            out.push('\n');
+        }
+    }
+    out
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+
 #[derive(Debug, Clone)]
 pub struct CodingAgentConfig {
     pub plan_system: String,
@@ -27,7 +107,16 @@ impl Default for CodingAgentConfig {
             plan_system: "You are a planning module. Produce a short, actionable plan.".to_string(),
             answer_system: "You are a coding agent. Use the plan and context to respond."
                 .to_string(),
-            action_system: "You are a coding agent with tool access. Output either:\n- FINAL: <final response>\n- a JSON object: {\"tool\": \"tool.name\", \"args\": {...}}\nReturn only one of those.\n\nIf the user asks to run/execute a command, read/write/edit files, or otherwise perform an action, you MUST output a tool JSON call (not FINAL). Do not reply with instructions for the user to run tools. Use one tool call per turn; after results are returned, you may call more tools or output FINAL.\nOnly use tools listed in Available tools. Do not invent tool names.\n\nBuilt-in tools:\n- fs.list {\"path\": \"...\", \"recursive\": bool?, \"max_entries\": int?}\n- fs.read {\"path\": \"...\", \"start_line\": int?, \"end_line\": int?, \"head\": int?, \"tail\": int?}\n- fs.edit {\"path\": \"...\", \"start_line\": int, \"end_line\": int, \"content\": \"...\"} OR {\"path\": \"...\", \"old\": \"...\", \"new\": \"...\"}\n- shell.exec {\"cmd\": \"echo\", \"args\": [\"Hello\"], \"cwd\": \"...\"?, \"timeout_ms\": int?} (cmd must be a bare command, no spaces)\nRequirement: call fs.read on a file before fs.edit on that file.\n\nTool note: code.exec runs Monty (Python subset) code with args {\"code\": \"...\", \"inputs\": {..}, \"input_names\": [..]}.\nMonty helpers: read(path), write(path, content), list(path), grep(path, pattern), exists(path)."
+            action_system: "\
+You are a coding agent with tool access. Output either:\n\
+- FINAL: <final response>\n\
+- a JSON object: {\"tool\": \"tool.name\", \"args\": {...}}\n\
+Return only one of those.\n\n\
+If the user asks to run/execute a command, read/write/edit files, or otherwise perform an \
+action, you MUST output a tool JSON call (not FINAL). Do not reply with instructions for \
+the user to run tools. Use one tool call per turn; after results are returned, you may \
+call more tools or output FINAL.\n\
+Only use tools listed under Available tools. Do not invent tool names."
                 .to_string(),
             max_plan_tokens: 256,
             max_answer_tokens: 512,
@@ -163,6 +252,7 @@ impl<'a> CodingAgent<'a> {
         tool_names: &[String],
         tool_schema_text: Option<&str>,
         exec_tool: &mut dyn FnMut(&ToolCallRequest) -> Result<String>,
+        on_final_check: &mut dyn FnMut() -> Option<String>,
         on_stream: &mut dyn FnMut(StreamTarget, StreamEvent, &str),
     ) -> Result<AgentResult> {
         if tool_names.is_empty() {
@@ -242,6 +332,12 @@ impl<'a> CodingAgent<'a> {
                         });
                         tool_context.push_str("\nTOOL_ERROR:\n");
                         tool_context.push_str(&msg);
+                        tool_context.push('\n');
+                        continue;
+                    }
+                    if let Some(reminder) = on_final_check() {
+                        tool_context.push_str("\nSYSTEM_REMINDER:\n");
+                        tool_context.push_str(&reminder);
                         tool_context.push('\n');
                         continue;
                     }
@@ -341,6 +437,7 @@ impl<'a> CodingAgent<'a> {
         tool_names: &[String],
         tool_schema_text: Option<&str>,
         exec_tool: &mut dyn FnMut(&ToolCallRequest) -> Result<String>,
+        on_final_check: &mut dyn FnMut() -> Option<String>,
         on_stream: &mut dyn FnMut(StreamTarget, StreamEvent, &str),
     ) -> Result<AgentResult> {
         if conv_history.is_empty() {
@@ -350,6 +447,7 @@ impl<'a> CodingAgent<'a> {
                 tool_names,
                 tool_schema_text,
                 exec_tool,
+                on_final_check,
                 on_stream,
             );
         }
@@ -482,6 +580,12 @@ impl<'a> CodingAgent<'a> {
                         attempts.push(Attempt { output: action_out, error_msg: msg.clone() });
                         tool_context.push_str("\nTOOL_ERROR:\n");
                         tool_context.push_str(&msg);
+                        tool_context.push('\n');
+                        continue;
+                    }
+                    if let Some(reminder) = on_final_check() {
+                        tool_context.push_str("\nSYSTEM_REMINDER:\n");
+                        tool_context.push_str(&reminder);
                         tool_context.push('\n');
                         continue;
                     }
@@ -631,22 +735,7 @@ fn build_action_prompt(
     config: &CodingAgentConfig,
 ) -> Prompt {
     let mut system = config.action_system.clone();
-    if !tool_names.is_empty() {
-        system.push_str("\nAvailable tools:\n");
-        for name in tool_names {
-            system.push_str("- ");
-            system.push_str(name);
-            system.push('\n');
-        }
-    }
-    if let Some(schema_text) = tool_schema_text {
-        if !schema_text.trim().is_empty() {
-            system.push('\n');
-            system.push_str("Tool schemas:\n");
-            system.push_str(schema_text.trim());
-            system.push('\n');
-        }
-    }
+    system.push_str(&render_tools_section(tool_names, tool_schema_text));
 
     let mut user = String::new();
     user.push_str("TASK:\n");
