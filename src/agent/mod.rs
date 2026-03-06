@@ -2,7 +2,7 @@ use anyhow::{anyhow, Result};
 use serde_json::Value;
 use std::collections::HashSet;
 
-use crate::llm::{Llm, Prompt};
+use crate::llm::{ConvMessage, Llm, Prompt};
 use crate::pipeline::assertions::{run_with_retry, Attempt, Constraint};
 
 pub mod context;
@@ -45,12 +45,23 @@ pub struct CodingAgent<'a> {
     config: CodingAgentConfig,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct ContextBreakdown {
+    pub system_tokens: usize,
+    pub history_user_tokens: usize,
+    pub history_assistant_tokens: usize,
+    pub task_tokens: usize,
+    pub context_chunks_tokens: usize,
+    pub tool_log_tokens: usize,
+}
+
 #[derive(Debug, Clone)]
 pub struct AgentResult {
     pub plan: String,
     pub answer: String,
     pub plan_attempts: Vec<Attempt>,
     pub answer_attempts: Vec<Attempt>,
+    pub context_breakdown: ContextBreakdown,
 }
 
 #[derive(Debug, Clone)]
@@ -101,6 +112,7 @@ impl<'a> CodingAgent<'a> {
             answer,
             plan_attempts,
             answer_attempts,
+            context_breakdown: ContextBreakdown::default(),
         })
     }
 
@@ -140,6 +152,7 @@ impl<'a> CodingAgent<'a> {
             answer,
             plan_attempts,
             answer_attempts,
+            context_breakdown: ContextBreakdown::default(),
         })
     }
 
@@ -313,8 +326,248 @@ impl<'a> CodingAgent<'a> {
             answer,
             plan_attempts,
             answer_attempts,
+            context_breakdown: ContextBreakdown::default(),
         })
     }
+
+    /// Multi-turn variant: accepts conversation history and user_turn_only flag.
+    /// Builds prompts as message arrays for proper multi-turn context.
+    pub fn run_with_history_streaming(
+        &mut self,
+        task: &str,
+        context: Option<&str>,
+        conv_history: &[ConvMessage],
+        user_turn_only: bool,
+        tool_names: &[String],
+        tool_schema_text: Option<&str>,
+        exec_tool: &mut dyn FnMut(&ToolCallRequest) -> Result<String>,
+        on_stream: &mut dyn FnMut(StreamTarget, StreamEvent, &str),
+    ) -> Result<AgentResult> {
+        if conv_history.is_empty() {
+            return self.run_with_tools_streaming(
+                task,
+                context,
+                tool_names,
+                tool_schema_text,
+                exec_tool,
+                on_stream,
+            );
+        }
+
+        // Estimate breakdown for ContextViz
+        let history_user_tokens: usize = conv_history
+            .iter()
+            .filter(|m| m.role == "user")
+            .map(|m| estimate_tokens(&m.content))
+            .sum();
+        let history_assistant_tokens: usize = if user_turn_only {
+            0
+        } else {
+            conv_history
+                .iter()
+                .filter(|m| m.role == "assistant")
+                .map(|m| estimate_tokens(&m.content))
+                .sum()
+        };
+
+        let (plan, plan_attempts) = run_with_retry(&self.config.plan_constraints, |attempts| {
+            let messages = build_plan_messages(
+                task,
+                context,
+                attempts,
+                &self.config,
+                conv_history,
+                user_turn_only,
+            );
+            on_stream(StreamTarget::Plan, StreamEvent::Start, "");
+            let out = self.llm.generate_messages_stream(
+                &messages,
+                self.config.max_plan_tokens,
+                &mut |chunk| on_stream(StreamTarget::Plan, StreamEvent::Chunk, chunk),
+            )?;
+            on_stream(StreamTarget::Plan, StreamEvent::End, "");
+            Ok(out)
+        })?;
+
+        if tool_names.is_empty() {
+            let (answer, answer_attempts) =
+                run_with_retry(&self.config.answer_constraints, |attempts| {
+                    let messages = build_answer_messages(
+                        task,
+                        context,
+                        &plan,
+                        None,
+                        None,
+                        attempts,
+                        &self.config,
+                        conv_history,
+                        user_turn_only,
+                    );
+                    on_stream(StreamTarget::Answer, StreamEvent::Start, "");
+                    let out = self.llm.generate_messages_stream(
+                        &messages,
+                        self.config.max_answer_tokens,
+                        &mut |chunk| on_stream(StreamTarget::Answer, StreamEvent::Chunk, chunk),
+                    )?;
+                    on_stream(StreamTarget::Answer, StreamEvent::End, "");
+                    Ok(out)
+                })?;
+
+            return Ok(AgentResult {
+                plan,
+                answer,
+                plan_attempts,
+                answer_attempts,
+                context_breakdown: ContextBreakdown {
+                    system_tokens: estimate_tokens(&self.config.answer_system),
+                    history_user_tokens,
+                    history_assistant_tokens,
+                    task_tokens: estimate_tokens(task),
+                    context_chunks_tokens: context.map(estimate_tokens).unwrap_or(0),
+                    tool_log_tokens: 0,
+                },
+            });
+        }
+
+        let mut attempts: Vec<Attempt> = Vec::new();
+        let mut tool_context = String::new();
+        let mut final_hint: Option<String> = None;
+        let required_tools = required_tools_from_task(task, tool_names);
+        let mut remaining_required: HashSet<String> = required_tools.iter().cloned().collect();
+        if !required_tools.is_empty() {
+            tool_context.push_str("REQUIRED_TOOLS:\n");
+            for tool in &required_tools {
+                tool_context.push_str("- ");
+                tool_context.push_str(tool);
+                tool_context.push('\n');
+            }
+            tool_context.push('\n');
+        }
+
+        for _ in 0..self.config.max_tool_iters.max(1) {
+            let messages = build_action_messages(
+                task,
+                context,
+                &plan,
+                &tool_context,
+                tool_names,
+                tool_schema_text,
+                &attempts,
+                &self.config,
+                conv_history,
+                user_turn_only,
+            );
+            on_stream(StreamTarget::Tool, StreamEvent::Start, "");
+            let action_out = self.llm.generate_messages_stream(
+                &messages,
+                self.config.max_action_tokens,
+                &mut |chunk| on_stream(StreamTarget::Tool, StreamEvent::Chunk, chunk),
+            )?;
+            on_stream(StreamTarget::Tool, StreamEvent::End, "");
+
+            if let Some(msg) = first_constraint_error(&self.config.action_constraints, &action_out) {
+                attempts.push(Attempt { output: action_out, error_msg: msg.clone() });
+                tool_context.push_str("\nACTION_FAILED:\n");
+                tool_context.push_str(&msg);
+                tool_context.push('\n');
+                continue;
+            }
+
+            match parse_action(&action_out) {
+                Ok(AgentAction::Final(answer)) => {
+                    if !remaining_required.is_empty() {
+                        let mut remaining: Vec<String> = remaining_required.iter().cloned().collect();
+                        remaining.sort();
+                        let msg = format!("must call required tools before FINAL: {}", remaining.join(", "));
+                        attempts.push(Attempt { output: action_out, error_msg: msg.clone() });
+                        tool_context.push_str("\nTOOL_ERROR:\n");
+                        tool_context.push_str(&msg);
+                        tool_context.push('\n');
+                        continue;
+                    }
+                    final_hint = Some(answer);
+                    break;
+                }
+                Ok(AgentAction::Tool(call)) => {
+                    if !tool_names.iter().any(|name| name == &call.name) {
+                        let msg = format!("unknown tool: {}. Use one of: {}", call.name, tool_names.join(", "));
+                        attempts.push(Attempt { output: action_out, error_msg: msg.clone() });
+                        tool_context.push_str("\nTOOL_ERROR:\n");
+                        tool_context.push_str(&msg);
+                        tool_context.push('\n');
+                        continue;
+                    }
+                    remaining_required.remove(&call.name);
+                    match exec_tool(&call) {
+                        Ok(result) => {
+                            tool_context.push_str("\nTOOL_CALL:\n");
+                            tool_context.push_str(&format!("{} {}\n", call.name, call.args));
+                            tool_context.push_str("TOOL_RESULT:\n");
+                            tool_context.push_str(&result);
+                            tool_context.push('\n');
+                        }
+                        Err(err) => {
+                            attempts.push(Attempt { output: action_out, error_msg: err.to_string() });
+                            tool_context.push_str("\nTOOL_ERROR:\n");
+                            tool_context.push_str(&err.to_string());
+                            tool_context.push('\n');
+                        }
+                    }
+                }
+                Err(err) => {
+                    attempts.push(Attempt { output: action_out, error_msg: err.to_string() });
+                }
+            }
+        }
+
+        let Some(final_hint) = final_hint else {
+            return Err(anyhow!("tool loop exceeded max iterations ({})", self.config.max_tool_iters));
+        };
+
+        let tool_log_tokens = estimate_tokens(&tool_context);
+        let (answer, answer_attempts) =
+            run_with_retry(&self.config.answer_constraints, |attempts| {
+                let messages = build_answer_messages(
+                    task,
+                    context,
+                    &plan,
+                    Some(&tool_context),
+                    Some(&final_hint),
+                    attempts,
+                    &self.config,
+                    conv_history,
+                    user_turn_only,
+                );
+                on_stream(StreamTarget::Answer, StreamEvent::Start, "");
+                let out = self.llm.generate_messages_stream(
+                    &messages,
+                    self.config.max_answer_tokens,
+                    &mut |chunk| on_stream(StreamTarget::Answer, StreamEvent::Chunk, chunk),
+                )?;
+                on_stream(StreamTarget::Answer, StreamEvent::End, "");
+                Ok(out)
+            })?;
+
+        Ok(AgentResult {
+            plan,
+            answer,
+            plan_attempts,
+            answer_attempts,
+            context_breakdown: ContextBreakdown {
+                system_tokens: estimate_tokens(&self.config.answer_system),
+                history_user_tokens,
+                history_assistant_tokens,
+                task_tokens: estimate_tokens(task),
+                context_chunks_tokens: context.map(estimate_tokens).unwrap_or(0),
+                tool_log_tokens,
+            },
+        })
+    }
+}
+
+fn estimate_tokens(text: &str) -> usize {
+    let chars = text.chars().count();
+    if chars == 0 { 0 } else { (chars + 3) / 4 }
 }
 
 fn required_tools_from_task(task: &str, tool_names: &[String]) -> Vec<String> {
@@ -484,6 +737,88 @@ fn first_constraint_error(constraints: &[Constraint], output: &str) -> Option<St
         }
     }
     None
+}
+
+fn build_plan_messages(
+    task: &str,
+    context: Option<&str>,
+    attempts: &[Attempt],
+    config: &CodingAgentConfig,
+    conv_history: &[ConvMessage],
+    user_turn_only: bool,
+) -> Vec<ConvMessage> {
+    let mut messages = vec![ConvMessage {
+        role: "system".to_string(),
+        content: config.plan_system.clone(),
+    }];
+    for msg in conv_history {
+        if user_turn_only && msg.role == "assistant" {
+            continue;
+        }
+        messages.push(msg.clone());
+    }
+    let prompt = build_plan_prompt(task, context, attempts, config);
+    messages.push(ConvMessage { role: "user".to_string(), content: prompt.user });
+    messages
+}
+
+fn build_action_messages(
+    task: &str,
+    context: Option<&str>,
+    plan: &str,
+    tool_context: &str,
+    tool_names: &[String],
+    tool_schema_text: Option<&str>,
+    attempts: &[Attempt],
+    config: &CodingAgentConfig,
+    conv_history: &[ConvMessage],
+    user_turn_only: bool,
+) -> Vec<ConvMessage> {
+    let action_prompt = build_action_prompt(
+        task, context, plan, tool_context, tool_names, tool_schema_text, attempts, config,
+    );
+    let mut messages = vec![ConvMessage {
+        role: "system".to_string(),
+        content: action_prompt.system.unwrap_or_default(),
+    }];
+    for msg in conv_history {
+        if user_turn_only && msg.role == "assistant" {
+            continue;
+        }
+        messages.push(msg.clone());
+    }
+    messages.push(ConvMessage { role: "user".to_string(), content: action_prompt.user });
+    messages
+}
+
+fn build_answer_messages(
+    task: &str,
+    context: Option<&str>,
+    plan: &str,
+    tool_context: Option<&str>,
+    draft: Option<&str>,
+    attempts: &[Attempt],
+    config: &CodingAgentConfig,
+    conv_history: &[ConvMessage],
+    user_turn_only: bool,
+) -> Vec<ConvMessage> {
+    let mut messages = vec![ConvMessage {
+        role: "system".to_string(),
+        content: config.answer_system.clone(),
+    }];
+    for msg in conv_history {
+        if user_turn_only && msg.role == "assistant" {
+            continue;
+        }
+        messages.push(msg.clone());
+    }
+    let prompt = if let Some(tc) = tool_context {
+        build_answer_prompt_with_tools(task, context, plan, tc, draft, attempts, config)
+    } else {
+        build_answer_prompt(task, context, plan, attempts, config)
+    };
+    messages.push(ConvMessage { role: "user".to_string(), content: prompt.user });
+    messages
 }
 
 pub(crate) fn build_plan_prompt(

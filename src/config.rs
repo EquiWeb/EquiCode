@@ -26,6 +26,9 @@ pub struct Config {
     pub exec_mode: String,
     pub plan_tokens: usize,
     pub answer_tokens: usize,
+    /// Max conversation turns to keep in history (None = unlimited).
+    /// Each turn = 1 user + 1 assistant message. Oldest turns are dropped first.
+    pub max_history_turns: Option<usize>,
     pub experiments: ExperimentConfig,
 }
 
@@ -41,6 +44,7 @@ impl Default for Config {
             exec_mode: "yolo".to_string(),
             plan_tokens: 256,
             answer_tokens: 512,
+            max_history_turns: Some(20),
             experiments: ExperimentConfig::default(),
         }
     }
@@ -73,11 +77,19 @@ impl Config {
         Ok(())
     }
 
+    /// Returns the effective OpenRouter API key: config value if set, else $OPENROUTER_API_KEY.
+    pub fn effective_openrouter_key(&self) -> Option<String> {
+        self.openrouter_api_key
+            .clone()
+            .filter(|k| !k.is_empty())
+            .or_else(|| std::env::var("OPENROUTER_API_KEY").ok().filter(|k| !k.is_empty()))
+    }
+
     pub fn is_configured(&self) -> bool {
         match self.backend {
-            Backend::Local => self.local_model_path.is_some(),
+            Backend::Local => self.local_model_path.as_ref().map(|p| !p.is_empty()).unwrap_or(false),
             Backend::OpenRouter => {
-                self.openrouter_api_key.as_ref().map(|k| !k.is_empty()).unwrap_or(false)
+                self.effective_openrouter_key().is_some()
                     && self.openrouter_model.as_ref().map(|m| !m.is_empty()).unwrap_or(false)
             }
         }
