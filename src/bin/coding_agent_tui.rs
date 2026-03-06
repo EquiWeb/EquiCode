@@ -8,7 +8,7 @@ use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScree
 use crossterm::{execute, ExecutableCommand};
 use ratatui::prelude::*;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
+use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph, Wrap};
 use std::io;
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -484,21 +484,27 @@ impl App {
     }
 
     fn update_history_render(&mut self) {
+        // Marker bytes decoded by render_lines for colored styling:
+        //   \x01U  → "You"       (yellow bold)
+        //   \x01A  → "Assistant" (cyan bold)
+        //   \x01T  → "Tools"     (magenta bold)
+        //   \x01S  → dim stats
+        //   \x01─  → turn divider (dark gray rule)
         let mut out = String::new();
         for (i, entry) in self.history.iter().enumerate() {
             if i > 0 {
-                out.push_str("\n\n");
+                out.push_str("\n\x01─\n\n");
             }
-            out.push_str("USER:\n");
+            out.push_str("\x01U\n");
             out.push_str(&entry.user);
-            out.push_str("\n\nASSISTANT:\n");
+            out.push_str("\n\n\x01A\n");
             out.push_str(&entry.answer);
             if !entry.tools.trim().is_empty() {
-                out.push_str("\n\nTOOLS:\n");
+                out.push_str("\n\n\x01T\n");
                 out.push_str(entry.tools.trim_end());
             }
             if !entry.stats.trim().is_empty() {
-                out.push_str("\n\n");
+                out.push_str("\n\n\x01S");
                 out.push_str(entry.stats.trim());
             }
         }
@@ -2172,7 +2178,12 @@ fn draw_ui(f: &mut Frame, app: &mut App) {
 
     app.input_rect = outer[2];
     let input_block = block_with_focus("Input", app.focus == Focus::Input);
-    let input = Paragraph::new(app.task_input.clone()).block(input_block).wrap(Wrap { trim: false });
+    let input_content: Line = if app.task_input.is_empty() && !app.is_generating {
+        Line::from(Span::styled("Type a task…  (/help for commands)", Style::default().fg(Color::DarkGray)))
+    } else {
+        Line::from(app.task_input.clone())
+    };
+    let input = Paragraph::new(input_content).block(input_block).wrap(Wrap { trim: false });
     f.render_widget(input, outer[2]);
 
     // Modal overlays rendered on top
@@ -2196,11 +2207,11 @@ fn draw_ui(f: &mut Frame, app: &mut App) {
 fn draw_settings_modal(f: &mut Frame, app: &App) {
     let area = centered_rect(70, 80, f.area());
     f.render_widget(Clear, area);
-    let block = block_with_focus("Settings  (↑↓ navigate · ←→ cycle · type · s=save · Esc=cancel)", true);
+    let block = block_modal("Settings  (↑↓ navigate · ←→ cycle · type · s=save · Esc=cancel)");
     let inner = block.inner(area);
     f.render_widget(block, area);
 
-    let fields: Vec<String> = (0..SETTINGS_FIELD_COUNT)
+    let fields: Vec<(String, Style)> = (0..SETTINGS_FIELD_COUNT)
         .map(|i| {
             let focused = i == app.settings_focus;
             let prefix = if focused { "> " } else { "  " };
@@ -2275,19 +2286,28 @@ fn draw_settings_modal(f: &mut Frame, app: &App) {
                 }
                 _ => String::new(),
             };
-            format!("{}{:<18} {}", prefix, name, value)
+            let row = format!("{}{:<18} {}", prefix, name, value);
+            let style = if focused {
+                Style::default().fg(Color::Cyan)
+            } else {
+                Style::default()
+            };
+            (row, style)
         })
-        .collect();
+        .collect::<Vec<_>>();
 
-    let text = fields.join("\n");
-    let para = Paragraph::new(text).wrap(Wrap { trim: false });
+    let lines: Vec<Line> = fields
+        .into_iter()
+        .map(|(text, style)| Line::from(Span::styled(text, style)))
+        .collect();
+    let para = Paragraph::new(lines).wrap(Wrap { trim: false });
     f.render_widget(para, inner);
 }
 
 fn draw_experiments_modal(f: &mut Frame, app: &App) {
     let area = centered_rect(60, 50, f.area());
     f.render_widget(Clear, area);
-    let block = block_with_focus("Experiments  (↑↓ navigate · Space toggle · s=save · Esc=close)", true);
+    let block = block_modal("Experiments  (↑↓ navigate · Space toggle · s=save · Esc=close)");
     let inner = block.inner(area);
     f.render_widget(block, area);
 
@@ -2323,7 +2343,7 @@ fn draw_experiments_modal(f: &mut Frame, app: &App) {
 fn draw_context_viz_modal(f: &mut Frame, app: &App) {
     let area = centered_rect(60, 55, f.area());
     f.render_widget(Clear, area);
-    let block = block_with_focus("Context Window Visualization  (Esc to close)", true);
+    let block = block_modal("Context Window Visualization  (Esc to close)");
     let inner = block.inner(area);
     f.render_widget(block, area);
 
@@ -2385,7 +2405,7 @@ fn draw_context_viz_modal(f: &mut Frame, app: &App) {
 fn draw_model_picker_modal(f: &mut Frame, app: &App) {
     let area = centered_rect(72, 75, f.area());
     f.render_widget(Clear, area);
-    let block = block_with_focus("Model Picker — OpenRouter  (type to filter · ↑↓ navigate · Enter select · Esc close)", true);
+    let block = block_modal("Model Picker — OpenRouter  (type to filter · ↑↓ navigate · Enter select · Esc close)");
     let inner = block.inner(area);
     f.render_widget(block, area);
 
@@ -2420,7 +2440,7 @@ fn draw_model_picker_modal(f: &mut Frame, app: &App) {
 fn draw_skills_manager_modal(f: &mut Frame, app: &App) {
     let area = centered_rect(65, 60, f.area());
     f.render_widget(Clear, area);
-    let block = block_with_focus("Skills Manager  (type URL · Enter install · Esc close)", true);
+    let block = block_modal("Skills Manager  (type URL · Enter install · Esc close)");
     let inner = block.inner(area);
     f.render_widget(block, area);
 
@@ -2467,6 +2487,14 @@ fn block_with_focus(title: &str, focused: bool) -> Block<'_> {
         Style::default().fg(Color::DarkGray)
     };
     Block::default().borders(Borders::ALL).title(title).border_style(style)
+}
+
+fn block_modal(title: &str) -> Block<'_> {
+    Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .title(title)
+        .border_style(Style::default().fg(Color::Cyan))
 }
 
 fn draw_approval_modal(f: &mut Frame, app: &App) {
@@ -2616,19 +2644,43 @@ fn wrap_lines(text: &str, width: u16) -> Vec<String> {
     out
 }
 
+/// Decode a `\x01X` marker line into a styled `Line`, or return None if not a marker.
+fn decode_marker_line(line: &str, width: u16) -> Option<Line<'static>> {
+    let mut chars = line.chars();
+    if chars.next() != Some('\x01') { return None; }
+    let tag = chars.next()?;
+    let rest: String = chars.collect();
+    Some(match tag {
+        'U' => Line::from(Span::styled("You", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))),
+        'A' => Line::from(Span::styled("Assistant", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))),
+        'T' => Line::from(Span::styled("Tools", Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD))),
+        'S' => Line::from(Span::styled(rest, Style::default().fg(Color::DarkGray))),
+        '─' => Line::from(Span::styled("─".repeat(width.max(4) as usize), Style::default().fg(Color::DarkGray))),
+        _ => Line::from(line.to_string()),
+    })
+}
+
 fn render_lines(text: &str, width: u16, selection: Option<&Selection>) -> Vec<Line<'static>> {
     let lines = wrap_lines(text, width);
     if lines.is_empty() { return vec![Line::from("")]; }
     let Some(sel) = selection else {
-        return lines.into_iter().map(Line::from).collect();
+        return lines.into_iter().map(|l| {
+            decode_marker_line(&l, width).unwrap_or_else(|| Line::from(l))
+        }).collect();
     };
-    if sel.is_empty() { return lines.into_iter().map(Line::from).collect(); }
+    if sel.is_empty() {
+        return lines.into_iter().map(|l| {
+            decode_marker_line(&l, width).unwrap_or_else(|| Line::from(l))
+        }).collect();
+    }
     let (start_line, start_col, end_line, end_col) = sel.normalized();
     let highlight = Style::default().bg(Color::Blue).fg(Color::White);
     lines
         .into_iter()
         .enumerate()
         .map(|(idx, line)| {
+            // Marker lines are never part of selection
+            if let Some(styled) = decode_marker_line(&line, width) { return styled; }
             let line_len = line.chars().count();
             if idx < start_line || idx > end_line { return Line::from(line); }
             let sel_start = if idx == start_line { start_col } else { 0 };
