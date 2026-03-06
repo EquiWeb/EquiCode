@@ -56,6 +56,11 @@ pub const BUILTIN_TOOLS: &[BuiltinToolDef] = &[
         args_hint: r#"{"id": <number>}"#,
         note: Some("mark a TODO item as completed"),
     },
+    BuiltinToolDef {
+        name: "ask.user",
+        args_hint: r#"{"question": "...", "options": ["recommended", "option2", ...]}"#,
+        note: Some("ask the user a question with up to 4 options; first option is recommended and auto-selected after 20s in yolo mode"),
+    },
 ];
 
 /// Renders the tools section appended to the action system prompt.

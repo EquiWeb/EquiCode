@@ -249,6 +249,7 @@ enum Focus {
     Chat,
     Overlay,
     Approval,
+    Question,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -300,6 +301,7 @@ enum WorkerCommand {
     InstallSkill { url: String },
     Reconfigure(Config),
     ClearHistory,
+    QuestionAnswer { id: u64, answer: String },
     Shutdown,
 }
 
@@ -330,6 +332,7 @@ enum WorkerEvent {
     SkillInstalled { name: String },
     SkillInstallError(String),
     TodosUpdated(Vec<TodoItem>),
+    UserQuestion { id: u64, question: String, options: Vec<String> },
 }
 
 struct WorkerSettings {
@@ -405,6 +408,12 @@ struct App {
     skills_status: String,
     // Todo tracking (mirrored from worker)
     todos: Vec<TodoItem>,
+    // Agent ask.user question
+    pending_question: Option<PendingQuestion>,
+    question_cursor: usize,
+    question_custom: String,
+    question_custom_active: bool,
+    question_deadline: Option<Instant>,
 }
 
 impl App {
@@ -478,6 +487,11 @@ impl App {
             skills_list: Vec::new(),
             skills_status: String::new(),
             todos: Vec::new(),
+            pending_question: None,
+            question_cursor: 0,
+            question_custom: String::new(),
+            question_custom_active: false,
+            question_deadline: None,
         };
         app.history.push(ChatEntry {
             user: "Quick Start".to_string(),
@@ -578,7 +592,7 @@ impl App {
                 self.auto_follow_overlay =
                     self.scroll_overlay >= max_scroll(text, self.overlay_width, self.overlay_height);
             }
-            Focus::Input | Focus::Approval => {}
+            Focus::Input | Focus::Approval | Focus::Question => {}
         }
     }
 }
@@ -598,6 +612,13 @@ struct PendingTool {
     id: u64,
     call: ToolCall,
     decision: PolicyDecision,
+}
+
+#[derive(Debug, Clone)]
+struct PendingQuestion {
+    id: u64,
+    question: String,
+    options: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -639,7 +660,7 @@ impl Focus {
             Self::Input => Self::Chat,
             Self::Chat => Self::Overlay,
             Self::Overlay => Self::Input,
-            Self::Approval => Self::Input,
+            Self::Approval | Self::Question => Self::Input,
         }
     }
     fn prev(self) -> Self {
@@ -647,7 +668,7 @@ impl Focus {
             Self::Input => Self::Overlay,
             Self::Chat => Self::Input,
             Self::Overlay => Self::Chat,
-            Self::Approval => Self::Input,
+            Self::Approval | Self::Question => Self::Input,
         }
     }
 }
@@ -678,6 +699,19 @@ fn run_app(
         while let Ok(evt) = evt_rx.try_recv() {
             handle_worker_event(app, evt)?;
             needs_draw = true;
+        }
+        // Yolo auto-answer: fire when deadline passes
+        if let (Some(pq), Some(deadline)) = (app.pending_question.as_ref(), app.question_deadline) {
+            if Instant::now() >= deadline {
+                let answer = pq.options.first().cloned().unwrap_or_default();
+                let id = pq.id;
+                app.pending_question = None;
+                app.question_deadline = None;
+                app.focus = Focus::Chat;
+                app.status = format!("Auto-selected: {}", answer);
+                let _ = cmd_tx.send(WorkerCommand::QuestionAnswer { id, answer });
+                needs_draw = true;
+            }
         }
         if needs_draw || last_draw.elapsed() >= Duration::from_millis(100) {
             terminal.draw(|f| draw_ui(f, app))?;
@@ -1112,6 +1146,11 @@ fn handle_key(
         }
     }
 
+    // Agent question modal (intercepts all keys when active)
+    if app.pending_question.is_some() {
+        return handle_question_key(app, key, cmd_tx);
+    }
+
     // Modal overlay key handling (intercepts all keys for modal overlays)
     if let Some(overlay) = app.overlay {
         if is_modal_overlay(overlay) {
@@ -1372,6 +1411,76 @@ fn handle_experiments_key(
             app.overlay = None;
             app.focus = Focus::Chat;
             app.status = "Experiments saved".to_string();
+        }
+        _ => {}
+    }
+    Ok(false)
+}
+
+fn handle_question_key(
+    app: &mut App,
+    key: KeyEvent,
+    cmd_tx: &Sender<WorkerCommand>,
+) -> Result<bool> {
+    let Some(pq) = app.pending_question.clone() else { return Ok(false); };
+    let n_options = pq.options.len().min(4);
+
+    fn submit(app: &mut App, cmd_tx: &Sender<WorkerCommand>, id: u64, answer: String) -> Result<bool> {
+        app.pending_question = None;
+        app.question_deadline = None;
+        app.question_custom.clear();
+        app.question_custom_active = false;
+        app.focus = Focus::Chat;
+        app.status = format!("Answered: {}", answer);
+        cmd_tx.send(WorkerCommand::QuestionAnswer { id, answer })?;
+        Ok(false)
+    }
+
+    if app.question_custom_active {
+        match key.code {
+            KeyCode::Enter => {
+                let answer = app.question_custom.trim().to_string();
+                if answer.is_empty() {
+                    app.question_custom_active = false;
+                    return Ok(false);
+                }
+                return submit(app, cmd_tx, pq.id, answer);
+            }
+            KeyCode::Esc => {
+                app.question_custom_active = false;
+                app.question_custom.clear();
+            }
+            KeyCode::Backspace => { app.question_custom.pop(); }
+            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                app.question_custom.push(c);
+            }
+            _ => {}
+        }
+        return Ok(false);
+    }
+
+    match key.code {
+        KeyCode::Up => {
+            if app.question_cursor > 0 { app.question_cursor -= 1; }
+        }
+        KeyCode::Down => {
+            if app.question_cursor + 1 < n_options { app.question_cursor += 1; }
+        }
+        KeyCode::Char(c @ '1'..='4') => {
+            let idx = (c as usize) - ('1' as usize);
+            if idx < n_options {
+                let answer = pq.options[idx].clone();
+                return submit(app, cmd_tx, pq.id, answer);
+            }
+        }
+        KeyCode::Enter => {
+            if let Some(answer) = pq.options.get(app.question_cursor).cloned() {
+                return submit(app, cmd_tx, pq.id, answer);
+            }
+        }
+        KeyCode::Char('c') | KeyCode::Char('C') => {
+            app.question_custom_active = true;
+            app.question_custom.clear();
         }
         _ => {}
     }
@@ -1904,6 +2013,24 @@ fn handle_worker_event(app: &mut App, event: WorkerEvent) -> Result<()> {
         WorkerEvent::TodosUpdated(items) => {
             app.todos = items;
         }
+        WorkerEvent::UserQuestion { id, question, options } => {
+            let is_yolo = app.exec_mode == ExecMode::Yolo;
+            app.pending_question = Some(PendingQuestion { id, question, options });
+            app.question_cursor = 0;
+            app.question_custom.clear();
+            app.question_custom_active = false;
+            app.question_deadline = if is_yolo {
+                Some(Instant::now() + Duration::from_secs(20))
+            } else {
+                None
+            };
+            app.focus = Focus::Question;
+            app.status = if is_yolo {
+                "Agent question — answer within 20s or first option auto-selected".to_string()
+            } else {
+                "Agent question — select an option or type a custom answer".to_string()
+            };
+        }
     }
     Ok(())
 }
@@ -2011,6 +2138,27 @@ fn worker_loop(
                     let _ = evt_tx2.send(WorkerEvent::ToolLog {
                         line: format!("\nTOOL_RUN: {} {}\n", call.name, call.args),
                     });
+                    if call.name == "ask.user" {
+                        let question = call.args.get("question")
+                            .and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+                        let options: Vec<String> = call.args.get("options")
+                            .and_then(|v| v.as_array())
+                            .map(|arr| arr.iter().filter_map(|v| v.as_str()).map(|s| s.to_string()).collect())
+                            .unwrap_or_default();
+                        if question.is_empty() {
+                            return Err(anyhow!("ask.user requires a non-empty question"));
+                        }
+                        let _ = evt_tx2.send(WorkerEvent::UserQuestion {
+                            id,
+                            question: question.clone(),
+                            options,
+                        });
+                        let answer = wait_for_question_answer(&cmd_rx, id)?;
+                        let _ = evt_tx2.send(WorkerEvent::ToolLog {
+                            line: format!("\nUSER_ANSWERED: {}\n", answer),
+                        });
+                        return Ok(answer);
+                    }
                     if call.name == "todo.create" {
                         let task_text = call.args.get("task").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
                         if task_text.is_empty() {
@@ -2196,6 +2344,7 @@ fn worker_loop(
                 let _ = evt_tx.send(WorkerEvent::TodosUpdated(vec![]));
             }
             WorkerCommand::Shutdown => break,
+            WorkerCommand::QuestionAnswer { .. } => {} // handled inside wait_for_question_answer
         }
     }
 }
@@ -2224,6 +2373,18 @@ fn wait_for_tool_decision(cmd_rx: &Receiver<WorkerCommand>, id: u64) -> Result<b
         match cmd_rx.recv()? {
             WorkerCommand::ToolDecision { id: resp_id, allow } => {
                 if resp_id == id { return Ok(allow); }
+            }
+            WorkerCommand::Shutdown => return Err(anyhow!("shutdown")),
+            _ => {}
+        }
+    }
+}
+
+fn wait_for_question_answer(cmd_rx: &Receiver<WorkerCommand>, id: u64) -> Result<String> {
+    loop {
+        match cmd_rx.recv()? {
+            WorkerCommand::QuestionAnswer { id: resp_id, answer } => {
+                if resp_id == id { return Ok(answer); }
             }
             WorkerCommand::Shutdown => return Err(anyhow!("shutdown")),
             _ => {}
@@ -2326,6 +2487,11 @@ fn draw_ui(f: &mut Frame, app: &mut App) {
     // Tool approval modal (highest priority)
     if app.pending_tool.is_some() {
         draw_approval_modal(f, app);
+    }
+
+    // Agent question modal (higher priority than approval — can't happen simultaneously)
+    if app.pending_question.is_some() {
+        draw_question_modal(f, app);
     }
 }
 
@@ -2781,6 +2947,87 @@ fn draw_approval_modal(f: &mut Frame, app: &App) {
             "  Also: Enter = approve  ·  Backspace = decline",
             Style::default().fg(Color::DarkGray),
         )));
+    }
+
+    let para = Paragraph::new(lines).wrap(Wrap { trim: false });
+    f.render_widget(para, inner);
+}
+
+fn draw_question_modal(f: &mut Frame, app: &App) {
+    let Some(pq) = app.pending_question.as_ref() else { return; };
+    let n_options = pq.options.len().min(4);
+
+    let area = centered_rect(68, 65, f.area());
+    f.render_widget(Clear, area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .title("❓ Agent Question")
+        .border_style(Style::default().fg(Color::LightBlue).add_modifier(Modifier::BOLD));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let w = inner.width.max(1) as usize;
+    let rule: String = "─".repeat(w.saturating_sub(2));
+    let dim = Style::default().fg(Color::DarkGray);
+    let cyan = Style::default().fg(Color::Cyan);
+    let selected = Style::default().fg(Color::Green).add_modifier(Modifier::BOLD);
+
+    let mut lines: Vec<Line> = vec![Line::from("")];
+
+    // Question text
+    for line in pq.question.lines() {
+        lines.push(Line::from(Span::styled(
+            format!("  {}", line),
+            Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+        )));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(&rule, dim)));
+    lines.push(Line::from(""));
+
+    // Options
+    for (i, opt) in pq.options.iter().take(4).enumerate() {
+        let is_cursor = i == app.question_cursor;
+        let cursor_ch = if is_cursor { "▶" } else { " " };
+        let num = format!("[{}]", i + 1);
+        let rec_tag = if i == 0 { " (recommended)" } else { "" };
+        let style = if is_cursor { selected } else { Style::default() };
+        lines.push(Line::from(vec![
+            Span::styled(format!("  {} {} ", cursor_ch, num), style),
+            Span::styled(format!("{}{}", opt, rec_tag), style),
+        ]));
+    }
+
+    // Countdown for yolo mode
+    if let Some(deadline) = app.question_deadline {
+        let secs_left = deadline.saturating_duration_since(Instant::now()).as_secs();
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            format!("  ⏱  Auto-selecting recommended answer in {}s…", secs_left),
+            Style::default().fg(Color::Yellow),
+        )));
+    }
+
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(&rule, dim)));
+
+    // Custom input
+    if app.question_custom_active {
+        lines.push(Line::from(""));
+        lines.push(Line::from(vec![
+            Span::styled("  Custom: ", cyan),
+            Span::styled(format!("{}_", app.question_custom), Style::default().fg(Color::White)),
+        ]));
+        lines.push(Line::from(Span::styled("  Enter = submit  ·  Esc = cancel", dim)));
+    } else {
+        lines.push(Line::from(vec![
+            Span::styled("  ↑↓ / 1–", dim),
+            Span::styled(n_options.to_string(), dim),
+            Span::styled(" navigate  ·  Enter select  ·  ", dim),
+            Span::styled("C", cyan.add_modifier(Modifier::BOLD)),
+            Span::styled(" custom answer", dim),
+        ]));
     }
 
     let para = Paragraph::new(lines).wrap(Wrap { trim: false });
