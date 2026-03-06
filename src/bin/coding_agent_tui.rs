@@ -2498,38 +2498,125 @@ fn block_modal(title: &str) -> Block<'_> {
 }
 
 fn draw_approval_modal(f: &mut Frame, app: &App) {
-    let area = centered_rect(70, 50, f.area());
-    f.render_widget(Clear, area);
-    let title = if app.approval_prompt_active { "Deny With Prompt" } else { "Tool Approval" };
-    let block = block_with_focus(title, app.focus == Focus::Approval);
-    let inner = block.inner(area);
-    let text = approval_modal_text(app);
-    let paragraph = Paragraph::new(render_lines(&text, inner.width.max(1), None))
-        .block(block)
-        .wrap(Wrap { trim: false });
-    f.render_widget(paragraph, area);
-}
+    let Some(pending) = app.pending_tool.as_ref() else { return; };
 
-fn approval_modal_text(app: &App) -> String {
-    let Some(pending) = app.pending_tool.as_ref() else { return String::new(); };
-    let mut out = String::new();
-    out.push_str("Tool request:\n");
-    out.push_str(&format!("name: {}\n", pending.call.name));
-    out.push_str(&format!("args: {}\n", pending.call.args));
-    out.push_str(&format!("risk: {:?}\n", pending.decision.risk));
-    if let Some(reason) = pending.decision.reason.as_ref() {
-        out.push_str(&format!("reason: {}\n", reason));
-    }
-    if app.approval_prompt_active {
-        out.push_str("\nDeny with prompt:\n> ");
-        out.push_str(&app.approval_prompt);
-        out.push_str("\n\nEnter = deny + prompt, Esc = cancel");
+    let area = centered_rect(66, 60, f.area());
+    f.render_widget(Clear, area);
+
+    let (title, border_color) = if app.approval_prompt_active {
+        ("✏  Deny With Prompt", Color::Yellow)
     } else {
-        out.push_str("\nApprove: a or Enter\n");
-        out.push_str("Decline: n or Backspace\n");
-        out.push_str("Deny with prompt: e");
+        ("⚠  Tool Approval Required", Color::Yellow)
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .title(title)
+        .border_style(Style::default().fg(border_color).add_modifier(Modifier::BOLD));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let w = inner.width.max(1) as usize;
+    let rule: String = "─".repeat(w.saturating_sub(2));
+
+    let mut lines: Vec<Line> = Vec::new();
+
+    if app.approval_prompt_active {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "Explain why and the agent will adjust its approach:",
+            Style::default().fg(Color::DarkGray),
+        )));
+        lines.push(Line::from(""));
+        let prompt_display = format!("> {}_", app.approval_prompt);
+        lines.push(Line::from(Span::styled(prompt_display, Style::default().fg(Color::White))));
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(&rule, Style::default().fg(Color::DarkGray))));
+        lines.push(Line::from(vec![
+            Span::styled("  Enter", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+            Span::raw(" send denial  ·  "),
+            Span::styled("Esc", Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD)),
+            Span::raw(" go back"),
+        ]));
+    } else {
+        // Tool info section
+        lines.push(Line::from(""));
+        let label_style = Style::default().fg(Color::DarkGray);
+        let value_style = Style::default().fg(Color::White);
+
+        lines.push(Line::from(vec![
+            Span::styled("  Tool   ", label_style),
+            Span::styled(pending.call.name.clone(), Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+        ]));
+
+        // Args: wrap long args across lines
+        let args_str = pending.call.args.to_string().replace('\n', " ");
+        let max_arg_len = w.saturating_sub(12);
+        if args_str.len() <= max_arg_len {
+            lines.push(Line::from(vec![
+                Span::styled("  Args   ", label_style),
+                Span::styled(args_str.clone(), value_style),
+            ]));
+        } else {
+            lines.push(Line::from(vec![
+                Span::styled("  Args   ", label_style),
+                Span::styled(args_str[..max_arg_len].to_string(), value_style),
+            ]));
+            let rest = &args_str[max_arg_len..];
+            for chunk in rest.chars().collect::<Vec<char>>().chunks(max_arg_len) {
+                let s: String = chunk.iter().collect();
+                lines.push(Line::from(vec![
+                    Span::raw("           "),
+                    Span::styled(s, value_style),
+                ]));
+            }
+        }
+
+        let risk_color = match pending.decision.risk {
+            varctx_proto::tools::Risk::Low    => Color::Green,
+            varctx_proto::tools::Risk::Medium => Color::Yellow,
+            varctx_proto::tools::Risk::High   => Color::Red,
+        };
+        let risk_label = match pending.decision.risk {
+            varctx_proto::tools::Risk::Low    => "Low",
+            varctx_proto::tools::Risk::Medium => "Medium",
+            varctx_proto::tools::Risk::High   => "High",
+        };
+        lines.push(Line::from(vec![
+            Span::styled("  Risk   ", label_style),
+            Span::styled(risk_label, Style::default().fg(risk_color).add_modifier(Modifier::BOLD)),
+        ]));
+
+        if let Some(reason) = pending.decision.reason.as_ref() {
+            lines.push(Line::from(vec![
+                Span::styled("  Reason ", label_style),
+                Span::styled(reason.clone(), value_style),
+            ]));
+        }
+
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(&rule, Style::default().fg(Color::DarkGray))));
+        lines.push(Line::from(""));
+
+        // Action buttons
+        lines.push(Line::from(vec![
+            Span::raw("  "),
+            Span::styled("[ A ]", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+            Span::styled(" Approve       ", Style::default().fg(Color::Green)),
+            Span::styled("[ N ]", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
+            Span::styled(" Decline       ", Style::default().fg(Color::Red)),
+            Span::styled("[ E ]", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Span::styled(" Deny with prompt", Style::default().fg(Color::Yellow)),
+        ]));
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "  Also: Enter = approve  ·  Backspace = decline",
+            Style::default().fg(Color::DarkGray),
+        )));
     }
-    out
+
+    let para = Paragraph::new(lines).wrap(Wrap { trim: false });
+    f.render_widget(para, inner);
 }
 
 fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
