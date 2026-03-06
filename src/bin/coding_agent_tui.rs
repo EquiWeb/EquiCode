@@ -2955,79 +2955,98 @@ fn draw_approval_modal(f: &mut Frame, app: &App) {
 
 fn draw_question_modal(f: &mut Frame, app: &App) {
     let Some(pq) = app.pending_question.as_ref() else { return; };
-    let n_options = pq.options.len().min(4);
 
-    let area = centered_rect(68, 65, f.area());
+    let area = centered_rect(66, 60, f.area());
     f.render_widget(Clear, area);
+
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .title("❓ Agent Question")
+        .title("❓  Agent Question")
         .border_style(Style::default().fg(Color::LightBlue).add_modifier(Modifier::BOLD));
     let inner = block.inner(area);
     f.render_widget(block, area);
 
     let w = inner.width.max(1) as usize;
     let rule: String = "─".repeat(w.saturating_sub(2));
+    let label_style = Style::default().fg(Color::DarkGray);
+    let value_style = Style::default().fg(Color::White);
     let dim = Style::default().fg(Color::DarkGray);
-    let cyan = Style::default().fg(Color::Cyan);
-    let selected = Style::default().fg(Color::Green).add_modifier(Modifier::BOLD);
 
     let mut lines: Vec<Line> = vec![Line::from("")];
 
-    // Question text
-    for line in pq.question.lines() {
-        lines.push(Line::from(Span::styled(
-            format!("  {}", line),
-            Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
-        )));
-    }
-    lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled(&rule, dim)));
-    lines.push(Line::from(""));
-
-    // Options
-    for (i, opt) in pq.options.iter().take(4).enumerate() {
-        let is_cursor = i == app.question_cursor;
-        let cursor_ch = if is_cursor { "▶" } else { " " };
-        let num = format!("[{}]", i + 1);
-        let rec_tag = if i == 0 { " (recommended)" } else { "" };
-        let style = if is_cursor { selected } else { Style::default() };
-        lines.push(Line::from(vec![
-            Span::styled(format!("  {} {} ", cursor_ch, num), style),
-            Span::styled(format!("{}{}", opt, rec_tag), style),
-        ]));
-    }
-
-    // Countdown for yolo mode
-    if let Some(deadline) = app.question_deadline {
-        let secs_left = deadline.saturating_duration_since(Instant::now()).as_secs();
-        lines.push(Line::from(""));
-        lines.push(Line::from(Span::styled(
-            format!("  ⏱  Auto-selecting recommended answer in {}s…", secs_left),
-            Style::default().fg(Color::Yellow),
-        )));
-    }
-
-    lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled(&rule, dim)));
-
-    // Custom input
     if app.question_custom_active {
+        // Custom input sub-view — matches approval "deny with prompt" style
+        lines.push(Line::from(Span::styled(
+            "  Type your custom answer:",
+            dim,
+        )));
         lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            format!("> {}_", app.question_custom),
+            value_style,
+        )));
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(&rule, dim)));
         lines.push(Line::from(vec![
-            Span::styled("  Custom: ", cyan),
-            Span::styled(format!("{}_", app.question_custom), Style::default().fg(Color::White)),
+            Span::styled("  Enter", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+            Span::raw(" submit  ·  "),
+            Span::styled("Esc", Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD)),
+            Span::raw(" go back"),
         ]));
-        lines.push(Line::from(Span::styled("  Enter = submit  ·  Esc = cancel", dim)));
     } else {
+        // Question text
         lines.push(Line::from(vec![
-            Span::styled("  ↑↓ / 1–", dim),
-            Span::styled(n_options.to_string(), dim),
-            Span::styled(" navigate  ·  Enter select  ·  ", dim),
-            Span::styled("C", cyan.add_modifier(Modifier::BOLD)),
-            Span::styled(" custom answer", dim),
+            Span::styled("  Question  ", label_style),
+            Span::styled(pq.question.replace('\n', " "), Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
         ]));
+
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(&rule, dim)));
+        lines.push(Line::from(""));
+
+        // Options
+        let selected_style = Style::default().fg(Color::Green).add_modifier(Modifier::BOLD);
+        let normal_style = Style::default().fg(Color::White);
+        for (i, opt) in pq.options.iter().take(4).enumerate() {
+            let is_cursor = i == app.question_cursor;
+            let cursor_ch = if is_cursor { "▶" } else { " " };
+            let rec_tag = if i == 0 { "  (recommended)" } else { "" };
+            let style = if is_cursor { selected_style } else { normal_style };
+            lines.push(Line::from(vec![
+                Span::styled(format!("  {} [{}] ", cursor_ch, i + 1), if is_cursor { selected_style } else { label_style }),
+                Span::styled(format!("{}{}", opt, rec_tag), style),
+            ]));
+        }
+
+        // Yolo countdown
+        if let Some(deadline) = app.question_deadline {
+            let secs_left = deadline.saturating_duration_since(Instant::now()).as_secs();
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                format!("  ⏱  Auto-selecting recommended in {}s", secs_left),
+                Style::default().fg(Color::Yellow),
+            )));
+        }
+
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(&rule, dim)));
+        lines.push(Line::from(""));
+
+        // Action buttons — same style as approval modal
+        let n = pq.options.len().min(4);
+        lines.push(Line::from(vec![
+            Span::raw("  "),
+            Span::styled("[ Enter ]", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+            Span::styled(" Select       ", Style::default().fg(Color::Green)),
+            Span::styled("[ C ]", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+            Span::styled(" Custom answer", Style::default().fg(Color::Cyan)),
+        ]));
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            format!("  Also: ↑↓ navigate  ·  1–{} direct select", n),
+            dim,
+        )));
     }
 
     let para = Paragraph::new(lines).wrap(Wrap { trim: false });
